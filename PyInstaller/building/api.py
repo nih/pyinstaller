@@ -1,5 +1,5 @@
 #-----------------------------------------------------------------------------
-# Copyright (c) 2005-2016, PyInstaller Development Team.
+# Copyright (c) 2005-2019, PyInstaller Development Team.
 #
 # Distributed under the terms of the GNU General Public License with exception
 # for distributing bootloader.
@@ -17,23 +17,20 @@ is a way how PyInstaller does the dependency analysis and creates executable.
 import os
 import shutil
 import tempfile
-import pkgutil
 import pprint
-import sys
 from operator import itemgetter
 
-from PyInstaller import is_win, is_darwin, HOMEPATH, PLATFORM
+from PyInstaller import HOMEPATH, PLATFORM
 from PyInstaller.archive.writers import ZlibArchiveWriter, CArchiveWriter
-from PyInstaller.building.utils import _check_guts_toc_mtime, _check_guts_toc, add_suffix_to_extensions, \
-    checkCache, _check_path_overlap, _rmtree
-from PyInstaller.compat import is_cygwin
-from PyInstaller.config import CONF
+from PyInstaller.building.utils import _check_guts_toc, add_suffix_to_extensions, \
+    checkCache, strip_paths_in_code, get_code_object, \
+    _make_clean_directory
+from PyInstaller.compat import is_win, is_darwin, is_linux, is_cygwin, exec_command_all
 from PyInstaller.depend import bindepend
 from PyInstaller.depend.analysis import get_bootstrap_modules
 from PyInstaller.depend.utils import is_path_to_egg
-from PyInstaller.building.datastruct import TOC, Target, logger, _check_guts_eq
+from PyInstaller.building.datastruct import TOC, Target, _check_guts_eq
 from PyInstaller.utils import misc
-from PyInstaller.utils.misc import save_py_data_struct
 from .. import log as logging
 
 logger = logging.getLogger(__name__)
@@ -81,11 +78,6 @@ class PYZ(Target):
             self.toc.extend(t)
             self.code_dict.update(getattr(t, '_code_cache', {}))
 
-        # Paths to remove from filenames embedded in code objects
-        self.replace_paths = sys.path + CONF['pathex']
-        # Make sure paths end with os.sep
-        self.replace_paths = [os.path.join(f, '') for f in self.replace_paths]
-
         self.name = name
         if name is None:
             self.name = os.path.splitext(self.tocfilename)[0] + '.pyz'
@@ -116,108 +108,32 @@ class PYZ(Target):
             return True
         return False
 
-    # TODO Could this function be merged with 'PyInstaller.utils.misc:get_code_object()'?
-    def __get_code(self, modname, filename):
-        """
-        Get the code-object for a module.
-
-        This is a extra-simple version for compiling a module. It's
-        not worth spending more effort here, as it is only used in the
-        rare case if outXX-Analysis.toc exists, but outXX-PYZ.toc does
-        not.
-        """
-
-        def load_code(modname, filename):
-            path_item = os.path.dirname(filename)
-            if os.path.basename(filename).startswith('__init__.py'):
-                # this is a package
-                path_item = os.path.dirname(path_item)
-            if os.path.basename(path_item) == '__pycache__':
-                path_item = os.path.dirname(path_item)
-            importer = pkgutil.get_importer(path_item)
-            package, _, modname = modname.rpartition('.')
-
-            if sys.version_info >= (3,3) and hasattr(importer, 'find_loader'):
-                loader, portions = importer.find_loader(modname)
-            else:
-                loader = importer.find_module(modname)
-                portions = []
-
-            assert loader and hasattr(loader, 'get_code')
-            logger.debug('Compiling %s', filename)
-            return loader.get_code(modname)
-
-        try:
-            if filename in ('-', None):
-                # This is a NamespacePackage, modulegraph marks them
-                # by using the filename '-'. (But wants to use None,
-                # so check for None, too, to be forward-compatible.)
-                logger.debug('Compiling namespace package %s', modname)
-                txt = '#\n'
-                return compile(txt, filename, 'exec')
-            else:
-                logger.debug('Compiling %s', filename)
-                co = load_code(modname, filename)
-                if not co:
-                    raise ValueError("Module file %s is missing" % filename)
-                return co
-        except SyntaxError as e:
-            print("Syntax error in ", filename)
-            print(e.args)
-            raise
-
     def assemble(self):
         logger.info("Building PYZ (ZlibArchive) %s", self.name)
         # Do not bundle PyInstaller bootstrap modules into PYZ archive.
         toc = self.toc - self.dependencies
-        for entry in toc:
+        for entry in toc[:]:
             if not entry[0] in self.code_dict and entry[2] == 'PYMODULE':
                 # For some reason the code-object, modulegraph created
                 # is not available. Recreate it
-                self.code_dict[entry[0]] = self.__get_code(entry[0], entry[1])
+                try:
+                    self.code_dict[entry[0]] = get_code_object(entry[0], entry[1])
+                except SyntaxError:
+                    # Exclude the module in case this is code meant for a newer Python version.
+                    toc.remove(entry)
         # sort content alphabetically to support reproducible builds
         toc.sort()
 
         # Remove leading parts of paths in code objects
         self.code_dict = {
-            key: self._strip_paths_in_code(code)
+            key: strip_paths_in_code(code)
             for key, code in self.code_dict.items()
         }
 
         pyz = ZlibArchiveWriter(self.name, toc, code_dict=self.code_dict, cipher=self.cipher)
+        logger.info("Building PYZ (ZlibArchive) %s completed successfully.",
+                    self.name)
 
-    def _strip_paths_in_code(self, co, new_filename=None):
-        if new_filename is None:
-            original_filename = os.path.normpath(co.co_filename)
-            for f in self.replace_paths:
-                if original_filename.startswith(f):
-                    new_filename = original_filename[len(f):]
-                    break
-
-            else:
-                return co
-
-        code_func = type(co)
-
-        consts = tuple(
-            self._strip_paths_in_code(const_co, new_filename)
-            if isinstance(const_co, code_func) else const_co
-            for const_co in co.co_consts
-        )
-
-        # co_kwonlyargcount added in some version of Python 3
-        if hasattr(co, 'co_kwonlyargcount'):
-            return code_func(co.co_argcount, co.co_kwonlyargcount, co.co_nlocals, co.co_stacksize,
-                         co.co_flags, co.co_code, consts, co.co_names,
-                         co.co_varnames, new_filename, co.co_name,
-                         co.co_firstlineno, co.co_lnotab,
-                         co.co_freevars, co.co_cellvars)
-        else:
-            return code_func(co.co_argcount, co.co_nlocals, co.co_stacksize,
-                         co.co_flags, co.co_code, consts, co.co_names,
-                         co.co_varnames, new_filename, co.co_name,
-                         co.co_firstlineno, co.co_lnotab,
-                         co.co_freevars, co.co_cellvars)
 
 class PKG(Target):
     """
@@ -320,20 +236,20 @@ class PKG(Target):
                         # happen if they come from different sources (eg. once from
                         # binary dependence, and once from direct import).
                         if inm in seenInms:
-                            logger.warn('Two binaries added with the same internal name.')
-                            logger.warn(pprint.pformat((inm, fnm, typ)))
-                            logger.warn('was placed previously at')
-                            logger.warn(pprint.pformat((inm, seenInms[inm], seenFnms_typ[seenInms[inm]])))
-                            logger.warn('Skipping %s.' % fnm)
+                            logger.warning('Two binaries added with the same internal name.')
+                            logger.warning(pprint.pformat((inm, fnm, typ)))
+                            logger.warning('was placed previously at')
+                            logger.warning(pprint.pformat((inm, seenInms[inm], seenFnms_typ[seenInms[inm]])))
+                            logger.warning('Skipping %s.' % fnm)
                             continue
 
                         # Warn if the same binary extension was included
                         # with multiple internal names
                         if fnm in seenFnms:
-                            logger.warn('One binary added with two internal names.')
-                            logger.warn(pprint.pformat((inm, fnm, typ)))
-                            logger.warn('was placed previously at')
-                            logger.warn(pprint.pformat((seenFnms[fnm], fnm, seenFnms_typ[fnm])))
+                            logger.warning('One binary added with two internal names.')
+                            logger.warning(pprint.pformat((inm, fnm, typ)))
+                            logger.warning('was placed previously at')
+                            logger.warning(pprint.pformat((seenFnms[fnm], fnm, seenFnms_typ[fnm])))
                     seenInms[inm] = fnm
                     seenFnms[fnm] = inm
                     seenFnms_typ[fnm] = typ
@@ -366,6 +282,8 @@ class PKG(Target):
 
         for item in trash:
             os.remove(item)
+        logger.info("Building PKG (CArchive) %s completed successfully.",
+                    os.path.basename(self.name))
 
 
 class EXE(Target):
@@ -382,6 +300,13 @@ class EXE(Target):
         kwargs
             Possible keywork arguments:
 
+            bootloader_ignore_signals
+                Non-Windows only. If True, the bootloader process will ignore
+                all ignorable signals. If False (default), it will forward
+                all signals to the child process. Useful in situations where
+                e.g. a supervisor process signals both the bootloader and
+                child (e.g. via a process group) to avoid signalling the
+                child twice.
             console
                 On Windows or OSX governs whether to use the console executable
                 or the windowed executable. Always True on Linux/Unix (always
@@ -414,6 +339,8 @@ class EXE(Target):
 
         # Available options for EXE in .spec files.
         self.exclude_binaries = kwargs.get('exclude_binaries', False)
+        self.bootloader_ignore_signals = kwargs.get(
+            'bootloader_ignore_signals', False)
         self.console = kwargs.get('console', True)
         self.debug = kwargs.get('debug', False)
         self.name = kwargs.get('name', None)
@@ -422,6 +349,7 @@ class EXE(Target):
         self.manifest = kwargs.get('manifest', None)
         self.resources = kwargs.get('resources', [])
         self.strip = kwargs.get('strip', False)
+        self.runtime_tmpdir = kwargs.get('runtime_tmpdir', None)
         # If ``append_pkg`` is false, the archive will not be appended
         # to the exe, but copied beside it.
         self.append_pkg = kwargs.get('append_pkg', True)
@@ -468,6 +396,13 @@ class EXE(Target):
                 self.toc.extend(arg.dependencies)
             else:
                 self.toc.extend(arg)
+
+        if self.runtime_tmpdir is not None:
+            self.toc.append(("pyi-runtime-tmpdir " + self.runtime_tmpdir, "", "OPTION"))
+
+        if self.bootloader_ignore_signals:
+            # no value; presence means "true"
+            self.toc.append(("pyi-bootloader-ignore-signals", "", "OPTION"))
 
         if is_win:
             filename = os.path.join(CONF['workpath'], CONF['specnm'] + ".exe.manifest")
@@ -534,9 +469,9 @@ class EXE(Target):
 
         if (data['versrsrc'] or data['resources']) and not is_win:
             # todo: really ignore :-)
-            logger.warn('ignoring version, manifest and resources, platform not capable')
+            logger.warning('ignoring version, manifest and resources, platform not capable')
         if data['icon'] and not (is_win or is_darwin):
-            logger.warn('ignoring icon, platform not capable')
+            logger.warning('ignoring icon, platform not capable')
 
         mtm = data['mtm']
         if mtm != misc.mtime(self.name):
@@ -570,9 +505,10 @@ class EXE(Target):
     def assemble(self):
         logger.info("Building EXE from %s", self.tocbasename)
         trash = []
+        if os.path.exists(self.name):
+            os.remove(self.name)
         if not os.path.exists(os.path.dirname(self.name)):
             os.makedirs(os.path.dirname(self.name))
-        outf = open(self.name, 'wb')
         exe = self.exefiles[0][1]  # pathname of bootloader
         if not os.path.exists(exe):
             raise SystemExit(_MISSING_BOOTLOADER_ERRORMSG)
@@ -580,7 +516,7 @@ class EXE(Target):
 
         if is_win and (self.icon or self.versrsrc or self.resources):
             tmpnm = tempfile.mktemp()
-            shutil.copy(exe, tmpnm)
+            self._copyfile(exe, tmpnm)
             os.chmod(tmpnm, 0o755)
             if self.icon:
                 icon.CopyIcons(tmpnm, self.icon)
@@ -634,37 +570,58 @@ class EXE(Target):
                                      restype, resname, tmpnm, resfile, exc_info=1)
             trash.append(tmpnm)
             exe = tmpnm
-        exe = checkCache(exe, strip=self.strip, upx=self.upx)
-        self.copy(exe, outf)
-        if self.append_pkg:
-            logger.info("Appending archive to EXE %s", self.name)
-            self.copy(self.pkg.name, outf)
-        else:
+
+        # NOTE: Do not look up for bootloader file in the cache because it might
+        #       get corrupted by UPX when UPX is available. See #1863 for details.
+
+        if not self.append_pkg:
+            logger.info("Copying bootloader exe to %s", self.name)
+            self._copyfile(exe, self.name)
             logger.info("Copying archive to %s", self.pkgname)
-            shutil.copy(self.pkg.name, self.pkgname)
-        outf.close()
+            self._copyfile(self.pkg.name, self.pkgname)
+        elif is_linux:
+            self._copyfile(exe, self.name)
+            logger.info("Appending archive to ELF section in EXE %s", self.name)
+            retcode, stdout, stderr = exec_command_all(
+                'objcopy', '--add-section', 'pydata=%s' % self.pkg.name,
+                self.name)
+            logger.debug("objcopy returned %i", retcode)
+            if stdout:
+                logger.debug(stdout)
+            if stderr:
+                logger.debug(stderr)
+            if retcode != 0:
+                raise SystemError("objcopy Failure: %s" % stderr)
+        else:
+            # Fall back to just append on end of file
+            logger.info("Appending archive to EXE %s", self.name)
+            with open(self.name, 'wb') as outf:
+                # write the bootloader data
+                with open(exe, 'rb') as infh:
+                    shutil.copyfileobj(infh, outf, length=64*1024)
+                # write the archive data
+                with open(self.pkg.name, 'rb') as infh:
+                    shutil.copyfileobj(infh, outf, length=64*1024)
 
         if is_darwin:
             # Fix Mach-O header for codesigning on OS X.
             logger.info("Fixing EXE for code signing %s", self.name)
             import PyInstaller.utils.osx as osxutils
             osxutils.fix_exe_for_code_signing(self.name)
-            pass
 
         os.chmod(self.name, 0o755)
         # get mtime for storing into the guts
         self.mtm = misc.mtime(self.name)
         for item in trash:
             os.remove(item)
+        logger.info("Building EXE from %s completed successfully.",
+                    self.tocbasename)
 
 
-    def copy(self, fnm, outf):
-        inf = open(fnm, 'rb')
-        while 1:
-            data = inf.read(64 * 1024)
-            if not data:
-                break
-            outf.write(data)
+    def _copyfile(self, infile, outfile):
+        with open(infile, 'rb') as infh:
+            with open(outfile, 'wb') as outfh:
+                shutil.copyfileobj(infh, outfh, length=64*1024)
 
 
 class COLLECT(Target):
@@ -684,6 +641,7 @@ class COLLECT(Target):
         from ..config import CONF
         Target.__init__(self)
         self.strip_binaries = kws.get('strip', False)
+        self.console = True
 
         if CONF['hasUPX']:
             self.upx_binaries = kws.get('upx', False)
@@ -706,6 +664,7 @@ class COLLECT(Target):
             elif isinstance(arg, Target):
                 self.toc.append((os.path.basename(arg.name), arg.name, arg.typ))
                 if isinstance(arg, EXE):
+                    self.console = arg.console
                     for tocnm, fnm, typ in arg.toc:
                         if tocnm == os.path.basename(arg.name) + ".manifest":
                             self.toc.append((tocnm, fnm, typ))
@@ -727,16 +686,15 @@ class COLLECT(Target):
         return 1
 
     def assemble(self):
-        if _check_path_overlap(self.name) and os.path.isdir(self.name):
-            _rmtree(self.name)
+        _make_clean_directory(self.name)
         logger.info("Building COLLECT %s", self.tocbasename)
-        os.makedirs(self.name)
         toc = add_suffix_to_extensions(self.toc)
         for inm, fnm, typ in toc:
             if not os.path.exists(fnm) or not os.path.isfile(fnm) and is_path_to_egg(fnm):
                 # file is contained within python egg, it is added with the egg
                 continue
-            if os.pardir in os.path.normpath(inm) or os.path.isabs(inm):
+            if os.pardir in os.path.normpath(inm).split(os.sep) \
+               or os.path.isabs(inm):
                 raise SystemExit('Security-Alert: try to store file outside '
                                  'of dist-directory. Aborting. %r' % inm)
             tofnm = os.path.join(self.name, inm)
@@ -748,13 +706,20 @@ class COLLECT(Target):
                                  upx=(self.upx_binaries and (is_win or is_cygwin)),
                                  dist_nm=inm)
             if typ != 'DEPENDENCY':
-                shutil.copy(fnm, tofnm)
+                if os.path.isdir(fnm):
+                    # beacuse shutil.copy2() is the default copy function
+                    # for shutil.copytree, this will also copy file metadata
+                    shutil.copytree(fnm, tofnm)
+                else:
+                    shutil.copy(fnm, tofnm)
                 try:
                     shutil.copystat(fnm, tofnm)
                 except OSError:
-                    logger.warn("failed to copy flags of %s", fnm)
+                    logger.warning("failed to copy flags of %s", fnm)
             if typ in ('EXTENSION', 'BINARY'):
                 os.chmod(tofnm, 0o755)
+        logger.info("Building COLLECT %s completed successfully.",
+                    self.tocbasename)
 
 
 class MERGE(object):
@@ -838,6 +803,6 @@ COMPRESSED = 1
 
 _MISSING_BOOTLOADER_ERRORMSG = """
 Fatal error: PyInstaller does not include a pre-compiled bootloader for your
-platform. See <http://pythonhosted.org/PyInstaller/#building-the-bootloader>
-for more details and instructions how to build the bootloader.
+platform. For more details and instructions how to build the bootloader see
+<https://pyinstaller.readthedocs.io/en/stable/bootloader-building.html>
 """

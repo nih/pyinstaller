@@ -1,5 +1,5 @@
 #-----------------------------------------------------------------------------
-# Copyright (c) 2013-2016, PyInstaller Development Team.
+# Copyright (c) 2013-2019, PyInstaller Development Team.
 #
 # Distributed under the terms of the GNU General Public License with exception
 # for distributing bootloader.
@@ -17,8 +17,7 @@ This CArchiveReader is used only by the archieve_viewer utility.
 import struct
 
 
-from PyInstaller.loader.pyimod02_archive import (
-    ArchiveReader, PYZ_TYPE_MODULE, PYZ_TYPE_PKG, PYZ_TYPE_DATA)
+from PyInstaller.loader.pyimod02_archive import ArchiveReader
 
 
 class NotAnArchiveError(Exception):
@@ -143,15 +142,21 @@ class CArchiveReader(ArchiveReader):
         else:
             self.lib.seek(0, 2)
         filelen = self.lib.tell()
-        if self.length:
-            self.lib.seek(self.start + self.length - self._cookie_size, 0)
-        else:
-            self.lib.seek(-self._cookie_size, 2)
+
+        self.lib.seek(max(0, filelen-4096))
+        searchpos = self.lib.tell()
+        buf = self.lib.read(min(filelen, 4096))
+        pos = buf.rfind(self.MAGIC)
+        if pos == -1:
+            raise RuntimeError("%s is not a valid %s archive file" %
+                               (self.path, self.__class__.__name__))
+        filelen = searchpos + pos + self._cookie_size
         (magic, totallen, tocpos, toclen, pyvers, pylib_name) = struct.unpack(
-                self._cookie_format, self.lib.read(self._cookie_size))
+            self._cookie_format, buf[pos:pos+self._cookie_size])
         if magic != self.MAGIC:
             raise RuntimeError("%s is not a valid %s archive file" %
-                    (self.path, self.__class__.__name__))
+                               (self.path, self.__class__.__name__))
+
         self.pkg_start = filelen - totallen
         if self.length:
             if totallen != self.length or self.pkg_start != self.start:

@@ -1,5 +1,5 @@
 #-----------------------------------------------------------------------------
-# Copyright (c) 2005-2016, PyInstaller Development Team.
+# Copyright (c) 2005-2019, PyInstaller Development Team.
 #
 # Distributed under the terms of the GNU General Public License with exception
 # for distributing bootloader.
@@ -23,7 +23,10 @@ from PyInstaller.utils.hooks import logger
 from PyInstaller import PACKAGEPATH
 
 def pre_find_module_path(api):
+    #FIXME: For reusability, move this into a new
+    #PyInstaller.configure.get_fake_modules_dir() utility function.
     # Absolute path of the faked sub-package.
     fake_dir = os.path.join(PACKAGEPATH, 'fake-modules')
+
     api.search_dirs = [fake_dir]
     logger.info('site: retargeting to fake-dir %r', fake_dir)

@@ -1,5 +1,5 @@
 #-----------------------------------------------------------------------------
-# Copyright (c) 2013-2016, PyInstaller Development Team.
+# Copyright (c) 2013-2019, PyInstaller Development Team.
 #
 # Distributed under the terms of the GNU General Public License with exception
 # for distributing bootloader.
@@ -11,24 +11,19 @@
 Find external dependencies of binary libraries.
 """
 
-
-import os
-import sys
-import re
-import platform
 import ctypes.util
+import os
+import re
+import sys
 from glob import glob
-
 # Required for extracting eggs.
 import zipfile
 import collections
 
 from .. import compat
-from ..compat import (is_win, is_unix, is_aix, is_solar, is_cygwin,
-                      is_darwin, is_freebsd, is_venv,
-                      base_prefix, PYDYLIB_NAMES)
+from ..compat import (is_win, is_unix, is_aix, is_solar, is_cygwin, is_hpux,
+                      is_darwin, is_freebsd, is_venv, base_prefix, PYDYLIB_NAMES)
 from . import dylib, utils
-
 
 from .. import log as logging
 from ..utils.win32 import winutils
@@ -43,6 +38,9 @@ if is_win:
     from ..utils.win32.winmanifest import GetManifestResources
     from ..utils.win32.winmanifest import Manifest
     from ..utils.win32 import winresource
+    import pefile
+    # Do not load all the directories information from the PE file
+    pefile.fast_load = True
 
 
 def getfullnameof(mod, xtrapath=None):
@@ -70,7 +68,8 @@ def getfullnameof(mod, xtrapath=None):
 
     # TODO check if this 'numpy' workaround is still necessary!
     # Search sys.path first!
-    epath = sys.path + numpy_core_paths + winutils.get_system_path()
+    epath = (sys.path + numpy_core_paths + winutils.get_system_path() +
+             compat.getenv('PATH', '').split(os.pathsep))
     if xtrapath is not None:
         if type(xtrapath) == type(''):
             epath.insert(0, xtrapath)
@@ -96,7 +95,6 @@ def _getImports_pe(pth):
     and uses library pefile for that and supports
     32/64bit Windows
     """
-    from ..lib import pefile
     dlls = set()
     # By default library pefile parses all PE information.
     # We are only interested in the list of dependent dlls.
@@ -107,14 +105,17 @@ def _getImports_pe(pth):
     pe.parse_data_directories(directories=[
         pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT'],
         pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_EXPORT'],
-        ], forwarded_exports_only=True,
-        import_dllnames_only=True)
+        ],
+        forwarded_exports_only=True,
+        import_dllnames_only=True,
+        )
 
     # Some libraries have no other binary dependencies. Use empty list
     # in that case. Otherwise pefile would return None.
     # e.g. C:\windows\system32\kernel32.dll on Wine
     for entry in getattr(pe, 'DIRECTORY_ENTRY_IMPORT', []):
-        dlls.add(entry.dll)
+        dll_str = winutils.convert_dll_name_to_str(entry.dll)
+        dlls.add(dll_str)
 
     # We must also read the exports table to find forwarded symbols:
     # http://blogs.msdn.com/b/oldnewthing/archive/2006/07/19/671238.aspx
@@ -122,10 +123,13 @@ def _getImports_pe(pth):
     if exportSymbols:
         for sym in exportSymbols.symbols:
             if sym.forwarder is not None:
+                # sym.forwarder is a bytes object. Convert it to a string.
+                forwarder = winutils.convert_dll_name_to_str(sym.forwarder)
                 # sym.forwarder is for example 'KERNEL32.EnterCriticalSection'
-                dll, _ = sym.forwarder.split('.')
+                dll, _ = forwarder.split('.')
                 dlls.add(dll + ".dll")
 
+    pe.close()
     return dlls
 
 
@@ -179,16 +183,23 @@ def matchDLLArch(filename):
     if not is_win:
         return True
 
-    from ..lib import pefile
-
     global _exe_machine_type
-    if _exe_machine_type is None:
-        exe_pe = pefile.PE(sys.executable, fast_load=True)
-        _exe_machine_type = exe_pe.FILE_HEADER.Machine
+    try:
+        if _exe_machine_type is None:
+            pefilename = sys.executable  # for exception handling
+            exe_pe = pefile.PE(sys.executable, fast_load=True)
+            _exe_machine_type = exe_pe.FILE_HEADER.Machine
+            exe_pe.close()
 
-    pe = pefile.PE(filename, fast_load=True)
+        pefilename = filename  # for exception handling
+        pe = pefile.PE(filename, fast_load=True)
+        match_arch = pe.FILE_HEADER.Machine == _exe_machine_type
+        pe.close()
+    except pefile.PEFormatError as exc:
+        raise SystemExit('Can not get architecture from file: %s\n'
+                         '  Reason: %s' % (pefilename, exception))
+    return match_arch
 
-    return pe.FILE_HEADER.Machine == _exe_machine_type
 
 def Dependencies(lTOC, xtrapath=None, manifest=None, redirects=None):
     """
@@ -314,9 +325,8 @@ def check_extract_from_egg(pth, todir=None):
                         dirname = os.path.dirname(pth)
                         if not os.path.isdir(dirname):
                             os.makedirs(dirname)
-                        f = open(pth, "wb")
-                        f.write(egg.read(member))
-                        f.close()
+                        with open(pth, "wb") as f:
+                            f.write(egg.read(member))
                     rv.append((pth, eggpth, member))
                 return rv
     return [(pth, None, None)]
@@ -338,9 +348,8 @@ def getAssemblies(pth):
     # check for manifest file
     manifestnm = pth + ".manifest"
     if os.path.isfile(manifestnm):
-        fd = open(manifestnm, "rb")
-        res = {RT_MANIFEST: {1: {0: fd.read()}}}
-        fd.close()
+        with open(manifestnm, "rb") as fd:
+            res = {RT_MANIFEST: {1: {0: fd.read()}}}
     else:
         # check the binary for embedded manifest
         try:
@@ -545,6 +554,12 @@ def _getImports_ldd(pth):
         #   'sharedlib.so'
         # Will not match the fake lib '/unix'
         lddPattern = re.compile(r"^\s*(((?P<libarchive>(.*\.a))(?P<objectmember>\(.*\)))|((?P<libshared>(.*\.so))))$")
+    elif is_hpux:
+        # Match libs of the form
+        #   'sharedlib.so => full-path-to-lib
+        # e.g.
+        #   'libpython2.7.so =>      /usr/local/lib/hpux32/libpython2.7.so'
+        lddPattern = re.compile(r"^\s+(.*)\s+=>\s+(.*)$")
     elif is_solar:
         # Match libs of the form
         #   'sharedlib.so => full-path-to-lib
@@ -571,6 +586,8 @@ def _getImports_ldd(pth):
                     #   'sharedlib.so'
                     lib = m.group('libshared')
                     name = os.path.basename(lib)
+            elif is_hpux:
+                name, lib = m.group(1), m.group(2)
             else:
                 name, lib = m.group(1), m.group(2)
             if name[:10] in ('linux-gate', 'linux-vdso'):
@@ -595,9 +612,9 @@ def _getImports_macholib(pth):
 
     This implementation is for Mac OS X and uses library macholib.
     """
-    from ..lib.macholib.MachO import MachO
-    from ..lib.macholib.mach_o import LC_RPATH
-    from ..lib.macholib.dyld import dyld_find
+    from macholib.MachO import MachO
+    from macholib.mach_o import LC_RPATH
+    from macholib.dyld import dyld_find
     rslt = set()
     seen = set()  # Libraries read from binary headers.
 
@@ -626,13 +643,18 @@ def _getImports_macholib(pth):
             #    '../lib\x00\x00')
             cmd_type = command[0].cmd
             if cmd_type == LC_RPATH:
-                rpath = str(command[2])
+                rpath = command[2].decode('utf-8')
                 # Remove trailing '\x00' characters.
                 # e.g. '../lib\x00\x00'
                 rpath = rpath.rstrip('\x00')
+                # Replace the @executable_path and @loader_path keywords
+                # with the actual path to the binary.
+                executable_path = os.path.dirname(pth)
+                rpath = re.sub('^@(executable_path|loader_path|rpath)(/|$)',
+                               executable_path + r'\2', rpath)
                 # Make rpath absolute. According to Apple doc LC_RPATH
                 # is always relative to the binary location.
-                rpath = os.path.normpath(os.path.join(os.path.dirname(pth), rpath))
+                rpath = os.path.normpath(os.path.join(executable_path, rpath))
                 run_paths.update([rpath])
             else:
                 # Frameworks that have this structure Name.framework/Versions/N/Name
@@ -642,12 +664,17 @@ def _getImports_macholib(pth):
                 if '.framework' in pth:
                     run_paths.update(['../../../'])
 
+    # for distributions like Anaconda, all of the dylibs are stored in the lib directory
+    # of the Python distribution, not alongside of the .so's in each module's subdirectory.
+    run_paths.add(os.path.join(base_prefix, 'lib'))
+
     ## Try to find files in file system.
 
     # In cases with @loader_path or @executable_path
     # try to look in the same directory as the checked binary is.
     # This seems to work in most cases.
     exec_path = os.path.abspath(os.path.dirname(pth))
+
 
     for lib in seen:
 
@@ -703,7 +730,11 @@ def getImports(pth):
             # dependencies should already have been handled by
             # selectAssemblies in that case, so just warn, return an empty
             # list and continue.
-            logger.warn('Can not get binary dependencies for file: %s', pth, exc_info=1)
+            # For less specific errors also log the traceback.
+            logger.warning('Can not get binary dependencies for file: %s', pth)
+            logger.warning(
+                '  Reason: %s', exception,
+                exc_info=not isinstance(exception, pefile.PEFormatError))
             return []
     elif is_darwin:
         return _getImports_macholib(pth)
@@ -775,6 +806,11 @@ def findLibrary(name):
 
         if is_aix:
             paths.append('/opt/freeware/lib')
+        elif is_hpux:
+            if arch == '32bit':
+                paths.append('/usr/local/lib/hpux32')
+            else:
+                paths.append('/usr/local/lib/hpux64')
         elif is_freebsd:
             paths.append('/usr/local/lib')
         for path in paths:
@@ -865,12 +901,14 @@ def get_python_library_path():
         # and exec_prefix. That's why we can use just sys.prefix.
         # In virtualenv PyInstaller is not able to find Python library.
         # We need special care for this case.
-        py_prefix = compat.base_prefix
-
-        for name in PYDYLIB_NAMES:
-            full_path = os.path.join(py_prefix, name)
-            if os.path.exists(full_path):
-                return full_path
+        # Anaconda places the python library in the lib directory, so
+        # we search this one as well.
+        prefixes = [compat.base_prefix, os.path.join(compat.base_prefix, 'lib')]
+        for prefix in prefixes:
+            for name in PYDYLIB_NAMES:
+                full_path = os.path.join(prefix, name)
+                if os.path.exists(full_path):
+                    return full_path
 
     # Python library NOT found. Return just None.
     return None

@@ -1,11 +1,14 @@
+==========
 Bootloader
 ==========
+
 Bootloader bootstraps Python for the frozen application. It is written in C 
 and the code is very platform specific. The bootloader has to be kept
 standalone without any dependencies on 3rd party libraries.
 
 Directory Structure
--------------------
+===============================
+
 * src
   Bootloader source code common for all platforms.
 * windows
@@ -18,31 +21,16 @@ Directory Structure
   PyInstaller icons for Windows bootloaders and the .app bundle on Mac OS X.
 
 Build instructions
-----------------------
-
-See <http://pythonhosted.org/PyInstaller/#building-the-bootloader>.
+===============================
 
 In short::
 
   ./waf all
 
-or::
+or for building a Linux Standard Base (LSB) compliant bootloader::
 
-  ./waf --no-lsb all
+  ./waf --lsb all
 
-
-Building for other platforms
--------------------------------
-
-To easy rebuilding the bootloader for other platforms and other
-word-sizes, you may use the enclosed ``Vagrantfile``. Example::
-
-  rm -f ../PyInstaller/bootloader/Linux-32*/*
-  vagrant up linux32 # will also rebuild
-  vagrant halt linux32
-  # verify the bootloader has been rebuild
-  git status ../PyInstaller/bootloader/
-
-Currently only ``linux32`` and ``linux64`` are supported. But there is
-some code for OS X prepared. If you have experience with OS X please
-help improving it.
+For more details, esp. about building for other target-platforms, please read
+<https://pyinstaller.readthedocs.io/en/latest/bootloader-building.html> (resp.
+the corresponsing file in the source: `../doc/bootloader-building.rst`).

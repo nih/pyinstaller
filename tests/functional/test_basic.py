@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 #-----------------------------------------------------------------------------
-# Copyright (c) 2005-2016, PyInstaller Development Team.
+# Copyright (c) 2005-2019, PyInstaller Development Team.
 #
 # Distributed under the terms of the GNU General Public License with exception
 # for distributing bootloader.
@@ -10,12 +10,9 @@
 
 # Library imports
 # ---------------
-import glob
 import locale
 import os
-import shutil
 import sys
-import subprocess
 
 # Third-party imports
 # -------------------
@@ -23,9 +20,10 @@ import pytest
 
 # Local imports
 # -------------
-from PyInstaller.compat import architecture, is_darwin, is_win, is_py2
-from PyInstaller.utils.tests import importorskip, skipif_win, skipif_winorosx, \
-    skipif_notwin, skipif_notosx
+from PyInstaller.compat import is_darwin, is_win, is_py2, is_py37
+from PyInstaller.utils.tests import importorskip, skipif, skipif_win, \
+    skipif_winorosx, skipif_notwin, skipif_notosx, skipif_no_compiler, xfail
+from PyInstaller.utils.hooks import is_module_satisfies
 
 
 def test_run_from_path_environ(pyi_builder):
@@ -49,11 +47,11 @@ def test_pyz_as_external_file(pyi_builder, monkeypatch):
         kwargs['append_pkg'] = False
         return EXE(*args, **kwargs)
 
-    # :todo: find a better way to not even run this test in ondir-mode
+    # :todo: find a better way to not even run this test in onefile-mode
     if pyi_builder._mode == 'onefile':
         pytest.skip('only --onedir')
 
-    import PyInstaller
+    import PyInstaller.building.build_main
     EXE = PyInstaller.building.build_main.EXE
     monkeypatch.setattr('PyInstaller.building.build_main.EXE', MyEXE)
 
@@ -77,6 +75,13 @@ def test_celementtree(pyi_builder):
         from xml.etree.cElementTree import ElementTree
         print('OK')
         """)
+
+
+# Test a build with some complexity with the ``noarchive`` debug option.
+def test_noarchive(pyi_builder):
+    pyi_builder.test_source("from xml.etree.cElementTree import ElementTree",
+                            pyi_args=['--debug=noarchive'])
+
 
 @importorskip('codecs')
 def test_codecs(pyi_builder):
@@ -137,6 +142,9 @@ def test_email(pyi_builder):
         from email.mime.nonmultipart import MIMENonMultipart
         """)
 
+
+@skipif(is_module_satisfies('Crypto >= 3'), reason='Bytecode encryption is not '
+        'compatible with pycryptodome.')
 @importorskip('Crypto')
 def test_feature_crypto(pyi_builder):
     pyi_builder.test_source(
@@ -194,30 +202,13 @@ def test_module_attributes(tmpdir, pyi_builder):
     pyi_builder.test_script('pyi_module_attributes.py')
 
 
+@xfail(is_darwin, reason='Issue #1895.')
 def test_module_reload(pyi_builder):
     pyi_builder.test_script('pyi_module_reload.py')
 
 
-# TODO move 'multiprocessig' tests into 'test_multiprocess.py.
-
-
-@importorskip('multiprocessing')
-def test_multiprocess(pyi_builder):
-    pyi_builder.test_script('pyi_multiprocess.py')
-
-
-@importorskip('multiprocessing')
-def test_multiprocess_forking(pyi_builder):
-    pyi_builder.test_script('pyi_multiprocess_forking.py')
-
-
-@importorskip('multiprocessing')
-def test_multiprocess_pool(pyi_builder):
-    pyi_builder.test_script('pyi_multiprocess_pool.py')
-
-
-# TODO skip this test if C compiler is not found.
 # TODO test it on OS X.
+@skipif_no_compiler
 def test_load_dll_using_ctypes(monkeypatch, pyi_builder, compiled_dylib):
     # Note that including the data_dir fixture copies files needed by this test.
     #
@@ -282,7 +273,7 @@ def test_option_verbose(pyi_builder, monkeypatch):
         args.append([('v', None, 'OPTION')])
         return EXE(*args, **kwargs)
 
-    import PyInstaller
+    import PyInstaller.building.build_main
     EXE = PyInstaller.building.build_main.EXE
     monkeypatch.setattr('PyInstaller.building.build_main.EXE', MyEXE)
 
@@ -302,7 +293,8 @@ def test_option_w_unset(pyi_builder):
         assert 'ignore' not in sys.warnoptions
         """)
 
-def test_option_w_ignore(pyi_builder, monkeypatch):
+
+def test_option_w_ignore(pyi_builder, monkeypatch, capsys):
     "Test to ensure that option W can be set."
 
     def MyEXE(*args, **kwargs):
@@ -310,7 +302,7 @@ def test_option_w_ignore(pyi_builder, monkeypatch):
         args.append([('W ignore', '', 'OPTION')])
         return EXE(*args, **kwargs)
 
-    import PyInstaller
+    import PyInstaller.building.build_main
     EXE = PyInstaller.building.build_main.EXE
     monkeypatch.setattr('PyInstaller.building.build_main.EXE', MyEXE)
 
@@ -320,6 +312,8 @@ def test_option_w_ignore(pyi_builder, monkeypatch):
         assert 'ignore' in sys.warnoptions
         """)
 
+    _, err = capsys.readouterr()
+    assert "'import warnings' failed" not in err
 
 @skipif_win
 def test_python_makefile(pyi_builder):
@@ -357,11 +351,12 @@ def test_stderr_encoding(tmpdir, pyi_builder):
                 # In Python 2 on Mac OS X and Linux 'sys.stderr.encoding' is set to None.
                 # On Windows when running in non-interactive terminal it is None.
                 enc = 'None'
-        elif sys.stderr.isatty():
+        elif sys.stderr.isatty() or is_py37:
             enc = str(sys.stderr.encoding)
         else:
             # For non-interactive stderr use locale encoding - ANSI codepage.
-            # This fixes the test when running with py.test and capturing output.
+            # This fixes the test when running with py.test and capturing
+            # output on Python 3.6 and earlier.
             enc = locale.getpreferredencoding(False)
         f.write(enc)
     pyi_builder.test_script('pyi_stderr_encoding.py')
@@ -376,11 +371,12 @@ def test_stdout_encoding(tmpdir, pyi_builder):
                 # In Python 2 on Mac OS X and Linux 'sys.stdout.encoding' is set to None.
                 # On Windows when running in non-interactive terminal it is None.
                 enc = 'None'
-        elif sys.stdout.isatty():
+        elif sys.stdout.isatty() or is_py37:
             enc = str(sys.stdout.encoding)
         else:
             # For non-interactive stderr use locale encoding - ANSI codepage.
-            # This fixes the test when running with py.test and capturing output.
+            # This fixes the test when running with py.test and capturing
+            # output on Python 3.6 and earlier.
             enc = locale.getpreferredencoding(False)
         f.write(enc)
     pyi_builder.test_script('pyi_stdout_encoding.py')
@@ -426,20 +422,29 @@ def test_xmldom_module(pyi_builder):
 def test_threading_module(pyi_builder):
     pyi_builder.test_source(
         """
+        from __future__ import print_function
         import threading
+        import sys
+
+        print('See stderr for messages')
+        def print_(*args): print(*args, file=sys.stderr)
 
         def doit(nm):
-            print(('%s started' % nm))
+            print_(nm, 'started')
             import pyi_testmod_threading
-            print(('%s %s' % (nm, pyi_testmod_threading.x)))
+            try:
+                print_(nm, pyi_testmod_threading.x)
+            finally:
+                print_(nm, pyi_testmod_threading)
 
         t1 = threading.Thread(target=doit, args=('t1',))
         t2 = threading.Thread(target=doit, args=('t2',))
         t1.start()
         t2.start()
         doit('main')
-        t1.join()
-        t2.join()
+        t1.join() ; print_('t1 joined')
+        t2.join() ; print_('t2 joined')
+        print_('finished.')
         """)
 
 
@@ -511,6 +516,8 @@ def test_renamed_exe(pyi_builder):
     pyi_builder._find_executables = _find_executables
     pyi_builder.test_source("print('Hello Python!')")
 
+def test_spec_with_utf8(pyi_builder_spec):
+    pyi_builder_spec.test_spec('spec-with-utf8.spec')
 
 @skipif_notosx
 def test_osx_override_info_plist(pyi_builder_spec):
@@ -533,3 +540,46 @@ def test_hook_collect_submodules(pyi_builder, script_dir):
         __import__('pyi_testmod_relimp.B.C')
         """,
         ['--additional-hooks-dir=%s' % script_dir.join('pyi_hooks')])
+
+# Test that PyInstaller can handle a script with an arbitrary extension.
+def test_arbitrary_ext(pyi_builder):
+    pyi_builder.test_script('pyi_arbitrary_ext.foo')
+
+def test_option_runtime_tmpdir(pyi_builder):
+    "Test to ensure that option `runtime_tmpdir` can be set and has effect."
+
+    pyi_builder.test_source(
+        """
+        print('test - runtime_tmpdir - custom runtime temporary directory')
+        import os
+        import sys
+        if sys.platform == 'win32':
+            import win32api
+        cwd = os.path.abspath(os.getcwd())
+        if sys.platform == 'win32' and sys.version_info < (3,):
+            cwd = win32api.GetShortPathName(cwd)
+        runtime_tmpdir = os.path.abspath(sys._MEIPASS)
+        # for onedir mode, runtime_tmpdir == cwd
+        # for onefile mode, os.path.dirname(runtime_tmpdir) == cwd
+        if not runtime_tmpdir == cwd and not os.path.dirname(runtime_tmpdir) == cwd:
+            raise SystemExit('Expected sys._MEIPASS to be under current working dir.'
+                             ' sys._MEIPASS = ' + runtime_tmpdir + ', cwd = ' + cwd)
+        print('test - done')
+        """,
+        ['--runtime-tmpdir=.']) # set runtime-tmpdir to current working dir
+
+
+@xfail(reason='Issue #3037 - all scripts share the same global vars')
+def test_several_scripts1(pyi_builder_spec):
+    """Verify each script has it's own global vars (original case, see issue
+    #2949).
+    """
+    pyi_builder_spec.test_spec('several-scripts1.spec')
+
+
+@xfail(reason='Issue #3037 - all scripts share the same global vars')
+def test_several_scripts2(pyi_builder_spec):
+    """
+    Verify each script has it's own global vars (basic test).
+    """
+    pyi_builder_spec.test_spec('several-scripts2.spec')

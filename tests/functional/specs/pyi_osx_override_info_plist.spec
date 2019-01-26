@@ -1,6 +1,6 @@
 # -*- mode: python -*-
 #-----------------------------------------------------------------------------
-# Copyright (c) 2005-2016, PyInstaller Development Team.
+# Copyright (c) 2005-2019, PyInstaller Development Team.
 #
 # Distributed under the terms of the GNU General Public License with exception
 # for distributing bootloader.
@@ -18,7 +18,7 @@ a = Analysis(['../scripts/pyi_helloworld.py'],
              binaries=None,
              datas=None,
              hiddenimports=[],
-             hookspath=None,
+             hookspath=[],
              runtime_hooks=None,
              excludes=None,
              cipher=block_cipher)

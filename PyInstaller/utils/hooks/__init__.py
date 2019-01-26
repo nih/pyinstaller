@@ -1,46 +1,32 @@
 #-----------------------------------------------------------------------------
-# Copyright (c) 2005-2016, PyInstaller Development Team.
+# Copyright (c) 2005-2019, PyInstaller Development Team.
 #
 # Distributed under the terms of the GNU General Public License with exception
 # for distributing bootloader.
 #
 # The full license is in the file COPYING.txt, distributed with this software.
 #-----------------------------------------------------------------------------
-
-
-# TODO: This module is getting a bit long in the tooth. Let's consider
-# splitting package-specific utility functions into new utility modules: e.g.,
-#
-# * "PyInstaller.util.hooks.django", containing all Django helpers.
-# * "PyInstaller.util.hooks.gi", containing all GObject-Introspection helpers.
-# * "PyInstaller.util.hooks.qt", containing all Qt helpers.
-
 import copy
 import glob
 import os
 import pkg_resources
 import pkgutil
-import re
 import sys
 import textwrap
 
-from ... import compat
-from ...compat import is_py2, is_win, is_py3, is_darwin, EXTENSION_SUFFIXES
-from ...utils import misc
+from ...compat import base_prefix, exec_command_stdout, exec_python, \
+    is_darwin, is_py2, is_py3, is_venv, string_types, open_file, \
+    EXTENSION_SUFFIXES, ALL_SUFFIXES
 from ... import HOMEPATH
 from ... import log as logging
-from ...depend.bindepend import findSystemLibrary
+from ...exceptions import ExecCommandFailed
 
 logger = logging.getLogger(__name__)
-
-
-# All these extension represent Python modules or extension modules
-PY_EXECUTABLE_SUFFIXES = set(['.py', '.pyc', '.pyd', '.pyo', '.so'])
 
 # These extensions represent Python executables and should therefore be
 # ignored when collecting data files.
 # NOTE: .dylib files are not Python executable and should not be in this list.
-PY_IGNORE_EXTENSIONS = set(['.py', '.pyc', '.pyd', '.pyo', '.so'])
+PY_IGNORE_EXTENSIONS = set(ALL_SUFFIXES)
 
 # Some hooks need to save some values. This is the dict that can be used for
 # that.
@@ -77,20 +63,19 @@ def __exec_python_cmd(cmd, env=None):
         if isinstance(pp, unicode):
             pp = pp.encode(sys.getfilesystemencoding())
 
-    # PYTHONPATH might be already defined in the 'env' argument. Prepend it.
-    if 'PYTHONPATH' in env:
-        pp = os.pathsep.join([env.get('PYTHONPATH'), pp])
+    # PYTHONPATH might be already defined in the 'env' argument or in
+    # the original 'os.environ'. Prepend it.
+    if 'PYTHONPATH' in pp_env:
+        pp = os.pathsep.join([pp_env.get('PYTHONPATH'), pp])
     pp_env['PYTHONPATH'] = pp
 
-    try:
-        txt = compat.exec_python(*cmd, env=pp_env)
-    except OSError as e:
-        raise SystemExit("Execution failed: %s" % e)
+    txt = exec_python(*cmd, env=pp_env)
     return txt.strip()
 
 
 def exec_statement(statement):
-    """Executes a Python statement in an externally spawned interpreter, and
+    """
+    Executes a Python statement in an externally spawned interpreter, and
     returns anything that was emitted in the standard output as a single string.
     """
     statement = textwrap.dedent(statement)
@@ -104,14 +89,14 @@ def exec_script(script_filename, env=None, *args):
     returns anything that was emitted in the standard output as a
     single string.
 
-    To prevent missuse, the script passed to utils.hooks.exec_script
+    To prevent misuse, the script passed to utils.hooks.exec_script
     must be located in the `PyInstaller/utils/hooks/subproc` directory.
     """
     script_filename = os.path.basename(script_filename)
     script_filename = os.path.join(os.path.dirname(__file__), 'subproc', script_filename)
     if not os.path.exists(script_filename):
-        raise SystemError("To prevent missuse, the script passed to "
-                          "PyInstaller.utils.hooks.exec-script must be located "
+        raise SystemError("To prevent misuse, the script passed to "
+                          "PyInstaller.utils.hooks.exec_script must be located "
                           "in the `PyInstaller/utils/hooks/subproc` directory.")
 
     cmd = [script_filename]
@@ -151,252 +136,40 @@ def get_pyextension_imports(modname):
     """
 
     statement = """
-import sys
-# Importing distutils filters common modules, especiall in virtualenv.
-import distutils
-original_modlist = set(sys.modules.keys())
-# When importing this module - sys.modules gets updated.
-import %(modname)s
-all_modlist = set(sys.modules.keys())
-diff = all_modlist - original_modlist
-# Module list contain original modname. We do not need it there.
-diff.discard('%(modname)s')
-# Print module list to stdout.
-print(list(diff))
-""" % {'modname': modname}
+        import sys
+        # Importing distutils filters common modules, especially in virtualenv.
+        import distutils
+        original_modlist = set(sys.modules.keys())
+        # When importing this module - sys.modules gets updated.
+        import %(modname)s
+        all_modlist = set(sys.modules.keys())
+        diff = all_modlist - original_modlist
+        # Module list contain original modname. We do not need it there.
+        diff.discard('%(modname)s')
+        # Print module list to stdout.
+        print(list(diff))
+    """ % {'modname': modname}
     module_imports = eval_statement(statement)
 
     if not module_imports:
         logger.error('Cannot find imports for module %s' % modname)
         return []  # Means no imports found or looking for imports failed.
-    #module_imports = filter(lambda x: not x.startswith('distutils'), module_imports)
+    # module_imports = filter(lambda x: not x.startswith('distutils'), module_imports)
     return module_imports
 
 
-def qt4_plugins_dir(ns='PyQt4'):
-    qt4_plugin_dirs = eval_statement(
-        "from %s.QtCore import QCoreApplication;"
-        "app=QCoreApplication([]);"
-        # For Python 2 print would give "<PyQt4.QtCore.QStringList
-        # object at 0x....>", so we need to convert each element separately
-        "str=getattr(__builtins__, 'unicode', str);" # for Python 2
-        "print([str(p) for p in app.libraryPaths()])" % ns)
-    if not qt4_plugin_dirs:
-        logger.error('Cannot find %s plugin directories' % ns)
-        return ""
-    for d in qt4_plugin_dirs:
-        if os.path.isdir(d):
-            return str(d)  # must be 8-bit chars for one-file builds
-    logger.error('Cannot find existing %s plugin directory' % ns)
-    return ""
-
-
-def qt4_phonon_plugins_dir(ns='PyQt4'):
-    qt4_plugin_dirs = eval_statement(
-        "from PyQt4.QtGui import QApplication;"
-        "app=QApplication([]); app.setApplicationName('pyinstaller');"
-        "from PyQt4.phonon import Phonon;"
-        "v=Phonon.VideoPlayer(Phonon.VideoCategory);"
-        # For Python 2 print would give "<PyQt4.QtCore.QStringList
-        # object at 0x....>", so we need to convert each element separately
-        "str=getattr(__builtins__, 'unicode', str);" # for Python 2
-        "print([str(p) for p in app.libraryPaths()])")
-    if not qt4_plugin_dirs:
-        logger.error("Cannot find PyQt4 phonon plugin directories")
-        return ""
-    for d in qt4_plugin_dirs:
-        if os.path.isdir(d):
-            return str(d)  # must be 8-bit chars for one-file builds
-    logger.error("Cannot find existing PyQt4 phonon plugin directory")
-    return ""
-
-
-def qt4_plugins_binaries(plugin_type, ns='PyQt4'):
-    """Return list of dynamic libraries formatted for mod.binaries."""
-    pdir = qt4_plugins_dir(ns=ns)
-    files = misc.dlls_in_dir(os.path.join(pdir, plugin_type))
-
-    # Windows:
-    #
-    # dlls_in_dir() grabs all files ending with *.dll, *.so and *.dylib in a certain
-    # directory. On Windows this would grab debug copies of Qt 4 plugins, which then
-    # causes PyInstaller to add a dependency on the Debug CRT __in addition__ to the
-    # release CRT.
-    #
-    # Since debug copies of Qt4 plugins end with "d4.dll" we filter them out of the
-    # list.
-    #
-    if is_win:
-        files = [f for f in files if not f.endswith("d4.dll")]
-
-    dest_dir = os.path.join('qt4_plugins', plugin_type)
-    binaries = [
-        (f, dest_dir)
-        for f in files]
-    return binaries
-
-
-def qt4_menu_nib_dir():
-    """Return path to Qt resource dir qt_menu.nib. OSX only"""
-    menu_dir = ''
-    # Detect MacPorts prefix (usually /opt/local).
-    # Suppose that PyInstaller is using python from macports.
-    macports_prefix = os.path.realpath(sys.executable).split('/Library')[0]
-
-    # list of directories where to look for qt_menu.nib
-    dirs = []
-
-    # Look into user-specified directory, just in case Qt4 is not installed
-    # in a standard location
-    if 'QTDIR' in os.environ:
-        dirs += [
-            os.path.join(os.environ['QTDIR'], "QtGui.framework/Versions/4/Resources"),
-            os.path.join(os.environ['QTDIR'], "lib", "QtGui.framework/Versions/4/Resources"),
-        ]
-
-    # If PyQt4 is built against Qt5 look for the qt_menu.nib in a user
-    # specified location, if it exists.
-    if 'QT5DIR' in os.environ:
-        dirs.append(os.path.join(os.environ['QT5DIR'],
-                                 "src", "plugins", "platforms", "cocoa"))
-
-    dirs += [
-        # Qt4 from MacPorts not compiled as framework.
-        os.path.join(macports_prefix, 'lib', 'Resources'),
-        # Qt4 from MacPorts compiled as framework.
-        os.path.join(macports_prefix, 'libexec', 'qt4-mac', 'lib',
-            'QtGui.framework', 'Versions', '4', 'Resources'),
-        # Qt4 installed into default location.
-        '/Library/Frameworks/QtGui.framework/Resources',
-        '/Library/Frameworks/QtGui.framework/Versions/4/Resources',
-        '/Library/Frameworks/QtGui.Framework/Versions/Current/Resources',
-    ]
-
-    # Qt from Homebrew
-    homebrewqtpath = get_homebrew_path('qt')
-    if homebrewqtpath:
-        dirs.append( os.path.join(homebrewqtpath,'lib','QtGui.framework','Versions','4','Resources') )
-
-    # Check directory existence
-    for d in dirs:
-        d = os.path.join(d, 'qt_menu.nib')
-        if os.path.exists(d):
-            menu_dir = d
-            break
-
-    if not menu_dir:
-        logger.error('Cannot find qt_menu.nib directory')
-    return menu_dir
-
-def qt5_plugins_dir():
-    if 'QT_PLUGIN_PATH' in os.environ and os.path.isdir(os.environ['QT_PLUGIN_PATH']):
-        return str(os.environ['QT_PLUGIN_PATH'])
-
-    qt5_plugin_dirs = eval_statement(
-        "from PyQt5.QtCore import QCoreApplication;"
-        "app=QCoreApplication([]);"
-        # For Python 2 print would give "<PyQt4.QtCore.QStringList
-        # object at 0x....>", so we need to convert each element separately
-        "str=getattr(__builtins__, 'unicode', str);" # for Python 2
-        "print([str(p) for p in app.libraryPaths()])")
-    if not qt5_plugin_dirs:
-        logger.error("Cannot find PyQt5 plugin directories")
-        return ""
-    for d in qt5_plugin_dirs:
-        if os.path.isdir(d):
-            return str(d)  # must be 8-bit chars for one-file builds
-    logger.error("Cannot find existing PyQt5 plugin directory")
-    return ""
-
-
-def qt5_phonon_plugins_dir():
-    qt5_plugin_dirs = eval_statement(
-        "from PyQt5.QtGui import QApplication;"
-        "app=QApplication([]); app.setApplicationName('pyinstaller');"
-        "from PyQt5.phonon import Phonon;"
-        "v=Phonon.VideoPlayer(Phonon.VideoCategory);"
-        # For Python 2 print would give "<PyQt4.QtCore.QStringList
-        # object at 0x....>", so we need to convert each element separately
-        "str=getattr(__builtins__, 'unicode', str);" # for Python 2
-        "print([str(p) for p in app.libraryPaths()])")
-    if not qt5_plugin_dirs:
-        logger.error("Cannot find PyQt5 phonon plugin directories")
-        return ""
-    for d in qt5_plugin_dirs:
-        if os.path.isdir(d):
-            return str(d)  # must be 8-bit chars for one-file builds
-    logger.error("Cannot find existing PyQt5 phonon plugin directory")
-    return ""
-
-
-def qt5_plugins_binaries(plugin_type):
-    """Return list of dynamic libraries formatted for mod.binaries."""
-    pdir = qt5_plugins_dir()
-    files = misc.dlls_in_dir(os.path.join(pdir, plugin_type))
-    dest_dir = os.path.join('qt5_plugins', plugin_type)
-    binaries = [
-        (f, dest_dir)
-        for f in files]
-    return binaries
-
-
-def qt5_menu_nib_dir():
-    """Return path to Qt resource dir qt_menu.nib. OSX only"""
-    menu_dir = ''
-
-    # If the QT5DIR env var is set then look there first. It should be set to the
-    # qtbase dir in the Qt5 distribution.
-    dirs = []
-    if 'QT5DIR' in os.environ:
-        dirs.append(os.path.join(os.environ['QT5DIR'],
-                                 "src", "plugins", "platforms", "cocoa"))
-        dirs.append(os.path.join(os.environ['QT5DIR'],
-                                 "src", "qtbase", "src", "plugins", "platforms", "cocoa"))
-
-    # As of the time of writing macports doesn't yet support Qt5. So this is
-    # just modified from the Qt4 version.
-    # FIXME: update this when MacPorts supports Qt5
-    # Detect MacPorts prefix (usually /opt/local).
-    # Suppose that PyInstaller is using python from macports.
-    macports_prefix = os.path.realpath(sys.executable).split('/Library')[0]
-    # list of directories where to look for qt_menu.nib
-    dirs.extend( [
-        # Qt5 from MacPorts not compiled as framework.
-        os.path.join(macports_prefix, 'lib', 'Resources'),
-        # Qt5 from MacPorts compiled as framework.
-        os.path.join(macports_prefix, 'libexec', 'qt5-mac', 'lib',
-            'QtGui.framework', 'Versions', '5', 'Resources'),
-        # Qt5 installed into default location.
-        '/Library/Frameworks/QtGui.framework/Resources',
-        '/Library/Frameworks/QtGui.framework/Versions/5/Resources',
-        '/Library/Frameworks/QtGui.Framework/Versions/Current/Resources',
-    ])
-
-    # Qt5 from Homebrew
-    homebrewqtpath = get_homebrew_path('qt5')
-    if homebrewqtpath:
-        dirs.append( os.path.join(homebrewqtpath,'src','qtbase','src','plugins','platforms','cocoa') )
-
-    # Check directory existence
-    for d in dirs:
-        d = os.path.join(d, 'qt_menu.nib')
-        if os.path.exists(d):
-            menu_dir = d
-            break
-
-    if not menu_dir:
-        logger.error('Cannot find qt_menu.nib directory')
-    return menu_dir
-
-def get_homebrew_path(formula = ''):
-    '''Return the homebrew path to the requested formula, or the global prefix when
-       called with no argument.  Returns the path as a string or None if not found.'''
+def get_homebrew_path(formula=''):
+    """
+    Return the homebrew path to the requested formula, or the global prefix when
+    called with no argument.  Returns the path as a string or None if not found.
+    :param formula:
+    """
     import subprocess
-    brewcmd = ['brew','--prefix']
+    brewcmd = ['brew', '--prefix']
     path = None
     if formula:
         brewcmd.append(formula)
-        dbgstr = 'homebrew formula "%s"' %formula
+        dbgstr = 'homebrew formula "%s"' % formula
     else:
         dbgstr = 'homebrew prefix'
     try:
@@ -412,143 +185,6 @@ def get_homebrew_path(formula = ''):
         return path
     else:
         return None
-
-def get_qmake_path(version = ''):
-    '''
-    Try to find the path to qmake with version given by the argument
-    as a string.
-    '''
-    import subprocess
-
-    # Use QT[45]DIR if specified in the environment
-    if 'QT5DIR' in os.environ and version[0] == '5':
-        logger.debug('Using $QT5DIR/bin as qmake path')
-        return os.path.join(os.environ['QT5DIR'],'bin','qmake')
-    if 'QT4DIR' in os.environ and version[0] == '4':
-        logger.debug('Using $QT4DIR/bin as qmake path')
-        return os.path.join(os.environ['QT4DIR'],'bin','qmake')
-
-    # try the default $PATH
-    dirs = ['']
-
-    # try homebrew paths
-    for formula in ('qt','qt5'):
-        homebrewqtpath = get_homebrew_path(formula)
-        if homebrewqtpath:
-            dirs.append(homebrewqtpath)
-
-    for dir in dirs:
-        try:
-            qmake = os.path.join(dir, 'qmake')
-            versionstring = subprocess.check_output([qmake, '-query',
-                                                     'QT_VERSION']).strip()
-            if is_py3:
-                # version string is probably just ASCII
-                versionstring = versionstring.decode('utf8')
-            if versionstring.find(version) == 0:
-                logger.debug('Found qmake version "%s" at "%s".'
-                             % (versionstring, qmake))
-                return qmake
-        except (OSError, subprocess.CalledProcessError):
-            pass
-    logger.debug('Could not find qmake matching version "%s".' % version)
-    return None
-
-
-def qt5_qml_dir():
-    qmake = get_qmake_path('5')
-    if qmake is None:
-        qmldir = ''
-        logger.error('Could not find qmake version 5.x, make sure PATH is '
-                     'set correctly or try setting QT5DIR.')
-    else:
-        qmldir = compat.exec_command(qmake, "-query", "QT_INSTALL_QML").strip()
-    if len(qmldir) == 0:
-        logger.error('Cannot find QT_INSTALL_QML directory, "qmake -query '
-                        + 'QT_INSTALL_QML" returned nothing')
-    elif not os.path.exists(qmldir):
-        logger.error("Directory QT_INSTALL_QML: %s doesn't exist" % qmldir)
-
-    # 'qmake -query' uses / as the path separator, even on Windows
-    qmldir = os.path.normpath(qmldir)
-    return qmldir
-
-def qt5_qml_data(dir):
-    """Return Qml library dir formatted for data"""
-    qmldir = qt5_qml_dir()
-    return (os.path.join(qmldir, dir), 'qml')
-
-def qt5_qml_plugins_binaries(dir):
-    """Return list of dynamic libraries formatted for mod.binaries."""
-    binaries = []
-    qmldir = qt5_qml_dir()
-    files = misc.dlls_in_subdirs(os.path.join(qmldir, dir))
-    for f in files:
-        relpath = os.path.relpath(f, qmldir)
-        instdir, file = os.path.split(relpath)
-        instdir = os.path.join("qml", instdir)
-        logger.debug("qt5_qml_plugins_binaries installing %s in %s"
-                     % (f, instdir) )
-        binaries.append((f, instdir))
-    return binaries
-
-
-def django_dottedstring_imports(django_root_dir):
-    """
-    Get all the necessary Django modules specified in settings.py.
-
-    In the settings.py the modules are specified in several variables
-    as strings.
-    """
-    pths = []
-    # Extend PYTHONPATH with parent dir of django_root_dir.
-    pths.append(misc.get_path_to_toplevel_modules(django_root_dir))
-    # Extend PYTHONPATH with django_root_dir.
-    # Many times Django users do not specify absolute imports in the settings module.
-    pths.append(django_root_dir)
-
-    package_name = os.path.basename(django_root_dir) + '.settings'
-    env = {'DJANGO_SETTINGS_MODULE': package_name,
-           'PYTHONPATH': os.pathsep.join(pths)}
-    ret = eval_script('django_import_finder.py', env=env)
-
-    return ret
-
-
-def django_find_root_dir():
-    """
-    Return path to directory (top-level Python package) that contains main django
-    files. Return None if no directory was detected.
-
-    Main Django project directory contain files like '__init__.py', 'settings.py'
-    and 'url.py'.
-
-    In Django 1.4+ the script 'manage.py' is not in the directory with 'settings.py'
-    but usually one level up. We need to detect this special case too.
-    """
-    # 'PyInstaller.config' cannot be imported as other top-level modules.
-    from ...config import CONF
-    # Get the directory with manage.py. Manage.py is supplied to PyInstaller as the
-    # first main executable script.
-    manage_py = CONF['main_script']
-    manage_dir = os.path.dirname(os.path.abspath(manage_py))
-
-    # Get the Django root directory. The directory that contains settings.py and url.py.
-    # It could be the directory containig manage.py or any of its subdirectories.
-    settings_dir = None
-    files = set(os.listdir(manage_dir))
-    if 'settings.py' in files and 'urls.py' in files:
-        settings_dir = manage_dir
-    else:
-        for f in files:
-            if os.path.isdir(os.path.join(manage_dir, f)):
-                subfiles = os.listdir(os.path.join(manage_dir, f))
-                # Subdirectory contains critical files.
-                if 'settings.py' in subfiles and 'urls.py' in subfiles:
-                    settings_dir = os.path.join(manage_dir, f)
-                    break  # Find the first directory.
-
-    return settings_dir
 
 
 # TODO Move to "hooks/hook-OpenGL.py", the only place where this is called.
@@ -646,9 +282,9 @@ def get_module_attribute(module_name, attr_name):
     # with actual attribute values. That's the hope, anyway.
     attr_value_if_undefined = '!)ABadCafe@(D15ea5e#*DeadBeef$&Fee1Dead%^'
     attr_value = exec_statement("""
-import %s as m
-print(getattr(m, %r, %r))
-""" % (module_name, attr_name, attr_value_if_undefined))
+        import %s as m
+        print(getattr(m, %r, %r))
+    """ % (module_name, attr_name, attr_value_if_undefined))
 
     if attr_value == attr_value_if_undefined:
         raise AttributeError(
@@ -667,7 +303,7 @@ def get_module_file_attribute(package):
 
     Parameters
     ----------
-    module_name : str
+    package : str
         Fully-qualified name of this module.
 
     Returns
@@ -681,65 +317,28 @@ def get_module_file_attribute(package):
     try:
         loader = pkgutil.find_loader(package)
         attr = loader.get_filename(package)
+        # The built-in ``datetime`` module returns ``None``. Mark this as
+        # an ``ImportError``.
+        if not attr:
+            raise ImportError
     # Second try to import module in a subprocess. Might raise ImportError.
     except (AttributeError, ImportError):
         # Statement to return __file__ attribute of a package.
         __file__statement = """
-import %s as p
-print(p.__file__)
-"""
+            import %s as p
+            try:
+                print(p.__file__)
+            except:
+                # If p lacks a file attribute, hide the exception.
+                pass
+        """
         attr = exec_statement(__file__statement % package)
         if not attr.strip():
             raise ImportError
     return attr
 
 
-# TODO: Rename to get_pywin32_module_dll_path() and move to a new
-# "PyInstaller.utils.hooks.win32" module.
-# NOTE: This function requires PyInstaller to be on the default "sys.path" for
-# the called Python process. Running py.test changes the working dir to a temp
-# dir, so PyInstaller should be installed via either "setup.py install" or
-# "setup.py develop" before running py.test.
-def get_pywin32_module_file_attribute(module_name):
-    """
-    Get the absolute path of the PyWin32 DLL specific to the PyWin32 module
-    with the passed name.
-
-    On import, each PyWin32 module:
-
-    * Imports a DLL specific to that module.
-    * Overwrites the values of all module attributes with values specific to
-      that DLL. This includes that module's `__file__` attribute, which then
-      provides the absolute path of that DLL.
-
-    This function safely imports that module in a PyWin32-aware subprocess and
-    returns the value of that module's `__file__` attribute.
-
-    Parameters
-    ----------
-    module_name : str
-        Fully-qualified name of that module.
-
-    Returns
-    ----------
-    str
-        Absolute path of that DLL.
-
-    See Also
-    ----------
-    `PyInstaller.utils.win32.winutils.import_pywin32_module()`
-        For further details.
-    """
-    statement = """
-from PyInstaller.utils.win32 import winutils
-module = winutils.import_pywin32_module('%s')
-print(module.__file__)
-"""
-    return exec_statement(statement % module_name)
-
-
-def is_module_satisfies(
-    requirements, version=None, version_attr='__version__'):
+def is_module_satisfies(requirements, version=None, version_attr='__version__'):
     """
     `True` if the module, package, or C extension described by the passed
     requirements string both exists and satisfies these requirements.
@@ -893,8 +492,12 @@ def is_module_satisfies(
         module_name = requirements_parsed.project_name
         version = get_module_attribute(module_name, version_attr)
 
-    # Compare this version against the version parsed from these requirements.
-    return version in requirements_parsed
+    if not version:
+        # Module does not exist in the system.
+        return False
+    else:
+        # Compare this version against the one parsed from the requirements.
+        return version in requirements_parsed
 
 
 def is_package(module_name):
@@ -909,7 +512,7 @@ def is_package(module_name):
     try:
         loader = pkgutil.find_loader(module_name)
     except Exception:
-        # When it fails to find a module loader then it points probably to a clas
+        # When it fails to find a module loader then it points probably to a class
         # or function and module is not a package. Just return False.
         return False
     else:
@@ -942,71 +545,105 @@ def get_package_paths(package):
     return pkg_base, pkg_dir
 
 
-def collect_submodules(package, subdir=None, pattern=None, endswith=False):
+def collect_submodules(package, filter=lambda name: True):
     """
-    The following two functions were originally written by Ryan Welsh
-    (welchr AT umich.edu).
-
-    :param pattern: String pattern to match only submodules containing
-                    this pattern in the name.
-    :param endswith: If True, will match using 'endswith'
-
-    This produces a list of strings which specify all the modules in
-    package.  Its results can be directly assigned to ``hiddenimports``
-    in a hook script; see, for example, hook-sphinx.py. The
-    package parameter must be a string which names the package. The
-    optional subdir give a subdirectory relative to package to search,
-    which is helpful when submodules are imported at run-time from a
-    directory lacking __init__.py. See hook-astroid.py for an example.
-
-    This function does not work on zipped Python eggs.
+    :param package: A string which names the package which will be search for
+        submodules.
+    :param approve: A function to filter through the submodules found,
+        selecting which should be included in the returned list. It takes one
+        argument, a string, which gives the name of a submodule. Only if the
+        function returns true is the given submodule is added to the list of
+        returned modules. For example, ``filter=lambda name: 'test' not in
+        name`` will return modules that don't contain the word ``test``.
+    :return: A list of strings which specify all the modules in package. Its
+        results can be directly assigned to ``hiddenimports`` in a hook script;
+        see, for example, ``hook-sphinx.py``.
 
     This function is used only for hook scripts, but not by the body of
     PyInstaller.
     """
     # Accept only strings as packages.
-    if type(package) is not str:
+    if not isinstance(package, string_types):
         raise ValueError
 
     logger.debug('Collecting submodules for %s' % package)
-    # Skip module that is not a package.
+    # Skip a module which is not a package.
     if not is_package(package):
-        logger.debug('collect_submodules: Module %s is not a package.' % package)
+        logger.debug('collect_submodules - Module %s is not a package.' % package)
         return []
 
+    # Determine the filesystem path to the specified package.
     pkg_base, pkg_dir = get_package_paths(package)
-    if subdir:
-        pkg_dir = os.path.join(pkg_dir, subdir)
-    # Walk through all file in the given package, looking for submodules.
-    mods = set()
-    for dirpath, dirnames, filenames in os.walk(pkg_dir):
-        # Change from OS separators to a dotted Python module path,
-        # removing the path up to the package's name. For example,
-        # '/abs/path/to/desired_package/sub_package' becomes
-        # 'desired_package.sub_package'
-        mod_path = remove_prefix(dirpath, pkg_base).replace(os.sep, ".")
 
-        # If this subdirectory is a package, add it and all other .py
-        # files in this subdirectory to the list of modules.
-        if '__init__.py' in filenames:
-            mods.add(mod_path)
-            for f in filenames:
-                extension = os.path.splitext(f)[1]
-                if ((remove_file_extension(f) != '__init__') and
-                    extension in PY_EXECUTABLE_SUFFIXES):
-                    modname = mod_path + "." + remove_file_extension(f)
-                    # TODO convert this into regex matching.
-                    # Skip submodules not matching pattern.
-                    if not pattern or (endswith and modname.endswith(pattern)) or \
-                                      (not endswith and pattern in modname):
-                        mods.add(modname)
-        else:
-        # If not, nothing here is part of the package; don't visit any of
-        # these subdirs.
-            del dirnames[:]
+    # Walk the package. Since this performs imports, do it in a separate
+    # process.
+    names = exec_statement("""
+        import sys
+        import pkgutil
 
-    logger.debug("- Found submodules: %s", mods)
+        # ``pkgutil.walk_packages`` doesn't walk subpackages of zipped files
+        # per https://bugs.python.org/issue14209. This is a workaround.
+        def walk_packages(path=None, prefix='', onerror=None):
+            def seen(p, m={{}}):
+                if p in m:
+                    return True
+                m[p] = True
+
+            for importer, name, ispkg in pkgutil.iter_modules(path, prefix):
+                if not name.startswith(prefix):   ## Added
+                    name = prefix + name          ## Added
+                yield importer, name, ispkg
+
+                if ispkg:
+                    try:
+                        __import__(name)
+                    except ImportError:
+                        if onerror is not None:
+                            onerror(name)
+                    except Exception:
+                        if onerror is not None:
+                            onerror(name)
+                        else:
+                            raise
+                    else:
+                        path = getattr(sys.modules[name], '__path__', None) or []
+
+                        # don't traverse path items we've seen before
+                        path = [p for p in path if not seen(p)]
+
+                        ## Use Py2 code here. It still works in Py3.
+                        for item in walk_packages(path, name+'.', onerror):
+                            yield item
+                        ## This is the original Py3 code.
+                        #yield from walk_packages(path, name+'.', onerror)
+
+        for module_loader, name, ispkg in walk_packages([{}], '{}.'):
+            print(name)
+        """.format(
+                  # Use repr to escape Windows backslashes.
+                  repr(pkg_dir), package))
+
+    # Include the package itself in the results.
+    mods = {package}
+    # Filter through the returend submodules.
+    for name in names.split():
+        if filter(name):
+            mods.add(name)
+
+    logger.debug("collect_submodules - Found submodules: %s", mods)
     return list(mods)
+
+
+def is_module_or_submodule(name, mod_or_submod):
+    """
+    This helper function is designed for use in the ``filter`` argument of
+    ``collect_submodules``, by returning ``True`` if the given ``name`` is
+    a module or a submodule of ``mod_or_submod``. For example:
+    ``collect_submodules('foo', lambda name: not is_module_or_submodule(name,
+    'foo.test'))`` excludes ``foo.test`` and ``foo.test.one`` but not
+    ``foo.testifier``.
+    """
+    return name.startswith(mod_or_submod + '.') or name == mod_or_submod
 
 
 # Patterns of dynamic library filenames that might be bundled with some
@@ -1014,10 +651,6 @@ def collect_submodules(package, subdir=None, pattern=None, endswith=False):
 PY_DYLIB_PATTERNS = [
     '*.dll',
     '*.dylib',
-    # Some packages contain dynamic libraries that ends with the same
-    # suffix as Python C extensions. E.g. zmq:  libzmq.pyd, libsodium.pyd.
-    # Those files usually starts with 'lib' prefix.
-    'lib*.pyd',
     'lib*.so',
 ]
 
@@ -1026,14 +659,14 @@ def collect_dynamic_libs(package, destdir=None):
     """
     This routine produces a list of (source, dest) of dynamic library
     files which reside in package. Its results can be directly assigned to
-    ``binaries`` in a hook script; see, for example, hook-zmq.py. The
-    package parameter must be a string which names the package.
+    ``binaries`` in a hook script. The package parameter must be a string which
+    names the package.
 
     :param destdir: Relative path to ./dist/APPNAME where the libraries
                     should be put.
     """
     # Accept only strings as packages.
-    if type(package) is not str:
+    if not isinstance(package, string_types):
         raise ValueError
 
     logger.debug('Collecting dynamic libraries for %s' % package)
@@ -1070,15 +703,19 @@ def collect_data_files(package, include_py_files=False, subdir=None):
     argument to True collects these files as well. This is typically used
     with Python routines (such as those in pkgutil) that search a given
     directory for Python executable files then load them as extensions or
-    plugins. See collect_submodules for a description of the subdir parameter.
+    plugins. The optional subdir give a subdirectory relative to package to
+    search, which is helpful when submodules are imported at run-time from a
+    directory lacking __init__.py
 
     This function does not work on zipped Python eggs.
 
     This function is used only for hook scripts, but not by the body of
     PyInstaller.
     """
+    logger.debug('Collecting data files for %s' % package)
+
     # Accept only strings as packages.
-    if type(package) is not str:
+    if not isinstance(package, string_types):
         raise ValueError
 
     pkg_base, pkg_dir = get_package_paths(package)
@@ -1089,16 +726,18 @@ def collect_data_files(package, include_py_files=False, subdir=None):
     for dirpath, dirnames, files in os.walk(pkg_dir):
         for f in files:
             extension = os.path.splitext(f)[1]
-            if include_py_files or (not extension in PY_IGNORE_EXTENSIONS):
+            if include_py_files or (extension not in PY_IGNORE_EXTENSIONS):
                 # Produce the tuple
                 # (/abs/path/to/source/mod/submod/file.dat,
-                #  mod/submod/file.dat)
+                #  mod/submod)
                 source = os.path.join(dirpath, f)
                 dest = remove_prefix(dirpath,
                                      os.path.dirname(pkg_base) + os.sep)
                 datas.append((source, dest))
 
+    logger.debug("collect_data_files - Found files: %s", datas)
     return datas
+
 
 def collect_system_data_files(path, destdir=None, include_py_files=False):
     """
@@ -1110,18 +749,22 @@ def collect_system_data_files(path, destdir=None, include_py_files=False):
     PyInstaller.
     """
     # Accept only strings as paths.
-    if type(path) is not str:
+    if not isinstance(path, string_types):
         raise ValueError
+    # The call to ``remove_prefix`` below assumes a path separate of ``os.sep``,
+    # which may not be true on Windows; Windows allows Linux path separators in
+    # filenames. Fix this.
+    path = os.path.normpath(path)
 
     # Walk through all file in the given package, looking for data files.
     datas = []
     for dirpath, dirnames, files in os.walk(path):
         for f in files:
             extension = os.path.splitext(f)[1]
-            if include_py_files or (not extension in PY_IGNORE_EXTENSIONS):
+            if include_py_files or (extension not in PY_IGNORE_EXTENSIONS):
                 # Produce the tuple
                 # (/abs/path/to/source/mod/submod/file.dat,
-                #  mod/submod/file.dat)
+                #  mod/submod/destdir)
                 source = os.path.join(dirpath, f)
                 dest = remove_prefix(dirpath,
                                      os.path.dirname(path) + os.sep)
@@ -1138,10 +781,10 @@ def _find_prefix(filename):
     prefixes, depending on the version of virtualenv.
     Try to find the correct one, which is assumed to be the longest one.
     """
-    if not compat.is_venv:
+    if not is_venv:
         return sys.prefix
     filename = os.path.abspath(filename)
-    prefixes = [os.path.abspath(sys.prefix), compat.base_prefix]
+    prefixes = [os.path.abspath(sys.prefix), base_prefix]
     possible_prefixes = []
     for prefix in prefixes:
         common = os.path.commonprefix([prefix, filename])
@@ -1149,6 +792,7 @@ def _find_prefix(filename):
             possible_prefixes.append(prefix)
     possible_prefixes.sort(key=lambda p: len(p), reverse=True)
     return possible_prefixes[0]
+
 
 def relpath_to_config_or_make(filename):
     """
@@ -1162,232 +806,11 @@ def relpath_to_config_or_make(filename):
     return os.path.relpath(os.path.dirname(filename), prefix)
 
 
-def get_typelibs(module, version):
-    '''deprecated; only here for backwards compat'''
-    logger.warn("get_typelibs is deprecated, use get_gi_typelibs instead")
-    return get_gi_typelibs(module, version)[1]
-
-def get_gi_libdir(module, version):
-    statement = """
-import gi
-gi.require_version("GIRepository", "2.0")
-from gi.repository import GIRepository
-repo = GIRepository.Repository.get_default()
-module, version = (%r, %r)
-repo.require(module, version,
-             GIRepository.RepositoryLoadFlags.IREPOSITORY_LOAD_FLAG_LAZY)
-print(repo.get_shared_library(module))
-"""
-    statement %= (module, version)
-    libs = exec_statement(statement).split(',')
-    for lib in libs:
-        path = findSystemLibrary(lib.strip())
-        return os.path.normpath(os.path.dirname(path))
-
-    raise ValueError("Could not find libdir for %s-%s" % (module, version))
-
-def get_gi_typelibs(module, version):
-    """
-    Returns a tuple of (binaries, datas, hiddenimports) to be used by PyGObject
-    related hooks. Searches for and adds dependencies recursively.
-
-    :param module: GI module name, as passed to 'gi.require_version()'
-    :param version: GI module version, as passed to 'gi.require_version()'
-    """
-    datas = []
-    binaries = []
-    hiddenimports = []
-
-    statement = """
-import gi
-gi.require_version("GIRepository", "2.0")
-from gi.repository import GIRepository
-repo = GIRepository.Repository.get_default()
-module, version = (%r, %r)
-repo.require(module, version,
-             GIRepository.RepositoryLoadFlags.IREPOSITORY_LOAD_FLAG_LAZY)
-get_deps = getattr(repo, 'get_immediate_dependencies', None)
-if not get_deps:
-    get_deps = repo.get_dependencies
-print({'sharedlib': repo.get_shared_library(module),
-       'typelib': repo.get_typelib_path(module),
-       'deps': get_deps(module) or []})
-"""
-    statement %= (module, version)
-    typelibs_data = eval_statement(statement)
-    if not typelibs_data:
-        logger.error("gi repository 'GIRepository 2.0' not found. "
-                     "Please make sure libgirepository-gir2.0 resp. "
-                     "lib64girepository-gir2.0 is installed.")
-        # :todo: should we raise a SystemError here?
-    else:
-        logger.debug("Adding files for %s %s", module, version)
-
-        if typelibs_data['sharedlib']:
-            for lib in typelibs_data['sharedlib'].split(','):
-                path = findSystemLibrary(lib.strip())
-                if path:
-                    logger.debug('Found shared library %s at %s', lib, path)
-                    binaries.append((path, ''))
-
-        d = gir_library_path_fix(typelibs_data['typelib'])
-        if d:
-            logger.debug('Found gir typelib at %s', d)
-            datas.append(d)
-
-        hiddenimports += collect_submodules('gi.overrides',
-                                            pattern='.' + module, endswith=True)
-
-        ## Load dependencies recursively
-        for dep in typelibs_data['deps']:
-            m, _ = dep.rsplit('-', 1)
-            hiddenimports += ['gi.repository.%s' % m]
-
-    return binaries, datas, hiddenimports
-
-
-def gir_library_path_fix(path):
-    import subprocess
-    # 'PyInstaller.config' cannot be imported as other top-level modules.
-    from ...config import CONF
-
-    path = os.path.abspath(path)
-    common_path = os.path.commonprefix([compat.base_prefix, path])
-    gir_path = os.path.join(common_path, 'share', 'gir-1.0')
-
-    typelib_name = os.path.basename(path)
-    gir_name = os.path.splitext(typelib_name)[0] + '.gir'
-
-    gir_file = os.path.join(gir_path, gir_name)
-
-    if is_darwin:
-        if not os.path.exists(gir_path):
-            logger.error('Unable to find gir directory: %s.\n'
-                         'Try installing your platforms gobject-introspection '
-                         'package.', gir_path)
-            return None
-        if not os.path.exists(gir_file):
-            logger.error('Unable to find gir file: %s.\n'
-                         'Try installing your platforms gobject-introspection '
-                         'package.', gir_file)
-            return None
-
-        with open(gir_file, 'r') as f:
-            lines = f.readlines()
-        with open(os.path.join(CONF['workpath'], gir_name), 'w') as f:
-            for line in lines:
-                if 'shared-library' in line:
-                    split = re.split('(=)', line)
-                    files = re.split('(["|,])', split[2])
-                    for count, item in enumerate(files):
-                        if 'lib' in item:
-                            files[count] = '@loader_path/' + os.path.basename(item)
-                    line = ''.join(split[0:2]) + ''.join(files)
-                f.write(line)
-
-        # g-ir-compiler expects a file so we cannot just pipe the fixed file to it.
-        command = subprocess.Popen(('g-ir-compiler', os.path.join(CONF['workpath'], gir_name),
-                                    '-o', os.path.join(CONF['workpath'], typelib_name)))
-        command.wait()
-
-        return os.path.join(CONF['workpath'], typelib_name), 'gi_typelibs'
-    else:
-        return (path, 'gi_typelibs')
-
-def get_glib_system_data_dirs():
-    statement = """
-import gi
-gi.require_version('GLib', '2.0')
-from gi.repository import GLib
-print(GLib.get_system_data_dirs())
-"""
-    data_dirs = eval_statement(statement)
-    if not data_dirs:
-        logger.error("gi repository 'GIRepository 2.0' not found. "
-                     "Please make sure libgirepository-gir2.0 resp. "
-                     "lib64girepository-gir2.0 is installed.")
-        # :todo: should we raise a SystemError here?
-    return data_dirs
-
-def get_glib_sysconf_dirs():
-    '''Tries to return the sysconf directories, eg /etc'''
-
-    if is_win:
-        # On windows, if you look at gtkwin32.c, sysconfdir is actually
-        # relative to the location of the GTK DLL. Since that's what
-        # we're actually interested in (not the user path), we have to
-        # do that the hard way'''
-        return [os.path.join(get_gi_libdir('GLib', '2.0'), 'etc')]
-
-    statement = """
-import gi
-gi.require_version('GLib', '2.0')
-from gi.repository import GLib
-print(GLib.get_system_config_dirs())
-"""
-    data_dirs = eval_statement(statement)
-    if not data_dirs:
-        logger.error("gi repository 'GIRepository 2.0' not found. "
-                     "Please make sure libgirepository-gir2.0 resp. "
-                     "lib64girepository-gir2.0 is installed.")
-        # :todo: should we raise a SystemError here?
-    return data_dirs
-
-def collect_glib_share_files(*path):
-    '''path is relative to the system data directory (eg, /usr/share)'''
-    glib_data_dirs = get_glib_system_data_dirs()
-    if glib_data_dirs == None:
-        return []
-
-    destdir = os.path.join('share', *path[:-1])
-
-    # TODO: will this return too much?
-    collected = []
-    for data_dir in glib_data_dirs:
-        p = os.path.join(data_dir, *path)
-        collected += collect_system_data_files(p, destdir=destdir, include_py_files=False)
-
-    return collected
-
-def collect_glib_etc_files(*path):
-    '''path is relative to the system config directory (eg, /etc)'''
-    glib_config_dirs = get_glib_sysconf_dirs()
-    if glib_config_dirs == None:
-        return []
-
-    destdir = os.path.join('etc', *path[:-1])
-
-    # TODO: will this return too much?
-    collected = []
-    for config_dir in glib_config_dirs:
-        p = os.path.join(config_dir, *path)
-        collected += collect_system_data_files(p, destdir=destdir, include_py_files=False)
-
-    return collected
-
-_glib_translations = None
-
-def collect_glib_translations(prog):
-    """
-    Returns a list of translations in the system locale directory whose
-    names equal prog.mo
-    """
-
-    global _glib_translations
-    if _glib_translations is None:
-        _glib_translations = collect_glib_share_files('locale')
-
-    names = [os.sep + prog + '.mo',
-             os.sep + prog + '.po']
-    namelen = len(names[0])
-
-    return [(src, dst) for src, dst in _glib_translations if src[-namelen:] in names]
-
 def copy_metadata(package_name):
     """
     This function returns a list to be assigned to the ``datas`` global
-    variable. This list instructs PyInstaller to copy the metadata for the given
-    package to PyInstaller's data directory.
+    variable. This list instructs PyInstaller to copy the metadata for the
+    given package to PyInstaller's data directory.
 
     Parameters
     ----------
@@ -1407,7 +830,8 @@ def copy_metadata(package_name):
           'Sphinx-1.3.2.dist-info')]
     """
 
-    # Some notes: to look at the metadata locations for all installed packages::
+    # Some notes: to look at the metadata locations for all installed
+    # packages::
     #
     #     for key, value in pkg_resources.working_set.by_key.iteritems():
     #         print('{}: {}'.format(key, value.egg_info))
@@ -1425,19 +849,166 @@ def copy_metadata(package_name):
     # the metadata-containing directory. The fourth item shows a package with no
     # metadata.
     #
-    # So, in cases 1-3, copy the metadata directory. In case 4, emit an error --
-    # there's no metadata to copy. See https://pythonhosted.org/setuptools/pkg_resources.html#getting-or-creating-distributions.
+    # So, in cases 1-3, copy the metadata directory. In case 4, emit an error
+    # -- there's no metadata to copy.
+    # See https://pythonhosted.org/setuptools/pkg_resources.html#getting-or-creating-distributions.
     # Unfortunately, there's no documentation on the ``egg_info`` attribute; it
     # was found through trial and error.
     dist = pkg_resources.get_distribution(package_name)
     metadata_dir = dist.egg_info
-    assert metadata_dir
+    # Determine a destination directory based on the standardized egg name for
+    # this distribution. This avoids some problems discussed in
+    # https://github.com/pyinstaller/pyinstaller/issues/1888.
+    dest_dir = '{}.egg-info'.format(dist.egg_name())
+    # Per https://github.com/pyinstaller/pyinstaller/issues/1888, ``egg_info``
+    # isn't always defined. Try a workaround based on a suggestion by
+    # @benoit-pierre in that issue.
+    if metadata_dir is None:
+        # We assume that this is an egg, so guess a name based on `egg_name()
+        # <https://pythonhosted.org/setuptools/pkg_resources.html#distribution-methods>`_.
+        metadata_dir = os.path.join(dist.location, dest_dir)
 
-    # We want to copy from the ``metadata_dir`` to PyInstaller, leaving off its
-    # prefix in ``sys.path``. The ``location`` attribute provides this prefix,
-    # per https://pythonhosted.org/setuptools/pkg_resources.html#distribution-attributes.
-    # For example, if ``package_name`` is ``regex``, then ``location = c:\python27\lib\site-packages``
-    # and ``metadata_dir = c:\python27\lib\site-packages\regex-2015.11.09.dist-info``.
-    # We should therefore return ``[ ('c:\python27\lib\site-packages\regex-2015.11.09.dist-info',
-    # 'regex-2015.11.09.dist-info') ]``.
-    return [ (metadata_dir, metadata_dir[len(dist.location) + len(os.sep):]) ]
+    assert os.path.exists(metadata_dir)
+    logger.debug('Package {} metadata found in {} belongs in {}'.format(
+      package_name, metadata_dir, dest_dir))
+
+    return [(metadata_dir, dest_dir)]
+
+
+def get_installer(module):
+    """
+    Try to find which package manager installed a module.
+
+    :param module: Module to check
+    :return: Package manager or None
+    """
+    file_name = get_module_file_attribute(module)
+    site_dir = file_name[:file_name.index('site-packages') + len('site-packages')]
+    # This is necessary for situations where the project name and module name don't match, i.e.
+    # Project name: pyenchant Module name: enchant
+    pkgs = pkg_resources.find_distributions(site_dir)
+    package = None
+    for pkg in pkgs:
+        if module.lower() in pkg.key:
+            package = pkg
+            break
+    metadata_dir, dest_dir = copy_metadata(package)[0]
+    # Check for an INSTALLER file in the metedata_dir and return the first line
+    # which should be the program that installed the module.
+    installer_file = os.path.join(metadata_dir, 'INSTALLER')
+    if os.path.isdir(metadata_dir) and os.path.exists(installer_file):
+        with open_file(installer_file, 'r') as installer_file_object:
+            lines = installer_file_object.readlines()
+            if lines[0] != '':
+                installer = lines[0].rstrip('\r\n')
+                logger.debug(
+                    'Found installer: \'{0}\' for module: \'{1}\' from package: \'{2}\''.format(installer, module,
+                                                                                                package))
+                return installer
+    if is_darwin:
+        try:
+            output = exec_command_stdout('port', 'provides', file_name)
+            if 'is provided by' in output:
+                logger.debug(
+                    'Found installer: \'macports\' for module: \'{0}\' from package: \'{1}\''.format(module, package))
+                return 'macports'
+        except ExecCommandFailed:
+            pass
+        real_path = os.path.realpath(file_name)
+        if 'Cellar' in real_path:
+            logger.debug(
+                'Found installer: \'homebrew\' for module: \'{0}\' from package: \'{1}\''.format(module, package))
+            return 'homebrew'
+    return None
+
+
+# ``_map_distribution_to_packages`` is expensive. Compute it when used, then
+# return the memoized value. This is a simple alternative to
+# ``functools.lru_cache``.
+def _memoize(f):
+    memo = []
+
+    def helper():
+        if not memo:
+            memo.append(f())
+        return memo[0]
+
+    return helper
+
+
+# Walk through every package, determining which distribution it is in.
+@_memoize
+def _map_distribution_to_packages():
+    logger.info('Determining a mapping of distributions to packages...')
+    dist_to_packages = {}
+    for p in sys.path:
+        # The path entry ``''`` refers to the current directory.
+        if not p:
+            p = '.'
+        # Ignore any entries in ``sys.path`` that don't exist.
+        try:
+            lds = os.listdir(p)
+        except:
+            pass
+        else:
+            for ld in lds:
+                # Not all packages belong to a distribution. Skip these.
+                try:
+                    dist = pkg_resources.get_distribution(ld)
+                except:
+                    pass
+                else:
+                    dist_to_packages.setdefault(dist.key, []).append(ld)
+
+    return dist_to_packages
+
+
+# Given a ``package_name`` as a string, this function returns a list of packages
+# needed to satisfy the requirements. This output can be assigned directly to
+# ``hiddenimports``.
+def requirements_for_package(package_name):
+    hiddenimports = []
+
+    dist_to_packages = _map_distribution_to_packages()
+    for requirement in pkg_resources.get_distribution(package_name).requires():
+        if requirement.key in dist_to_packages:
+            required_packages = dist_to_packages[requirement.key]
+            hiddenimports.extend(required_packages)
+        else:
+            logger.warning('Unable to find package for requirement %s from '
+                           'package %s.',
+                           requirement.project_name, package_name)
+
+    logger.info('Packages required by %s:\n%s', package_name, hiddenimports)
+    return hiddenimports
+
+
+# Given a package name as a string, return a tuple of ``datas, binaries,
+# hiddenimports`` containing all data files, binaries, and modules in the given
+# package. The value of ``include_py_files`` is passed directly to
+# ``collect_data_files``.
+#
+# Typical use: ``datas, binaries, hiddenimports = collect_all('my_module_name')``.
+def collect_all(package_name, include_py_files=True):
+    datas = []
+    try:
+        datas += copy_metadata(package_name)
+    except Exception as e:
+        logger.warning('Unable to copy metadata for %s: %s', package_name, e)
+    datas += collect_data_files(package_name, include_py_files)
+    binaries = collect_dynamic_libs(package_name)
+    hiddenimports = collect_submodules(package_name)
+    try:
+        hiddenimports += requirements_for_package(package_name)
+    except Exception as e:
+        logger.warning('Unable to determine requirements for %s: %s',
+                       package_name, e)
+
+    return datas, binaries, hiddenimports
+
+
+# These imports need to be here due to these modules recursively importing this module.
+from .django import *
+from .gi import *
+from .qt import *
+from .win32 import *

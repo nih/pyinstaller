@@ -1,5 +1,5 @@
 #-----------------------------------------------------------------------------
-# Copyright (c) 2013-2016, PyInstaller Development Team.
+# Copyright (c) 2013-2019, PyInstaller Development Team.
 #
 # Distributed under the terms of the GNU General Public License with exception
 # for distributing bootloader.
@@ -51,6 +51,22 @@ for moved_module in six._moved_attributes:
 print('}')
 ''')
 
-    api.add_runtime_module(api.module_name)
+    # Add "six.moves" as a runtime package rather than module. Modules cannot
+    # physically contain submodules; only packages can. In "from"-style import
+    # statements (e.g., "from six.moves import queue"), this implies that:
+    #
+    # * Attributes imported from customary modules are guaranteed *NOT* to be
+    #   submodules. Hence, ModuleGraph justifiably ignores these attributes.
+    #   While some attributes declared by "six.moves" are ignorable non-modules
+    #   (e.g., functions, classes), others are non-ignorable submodules that
+    #   must be imported. Adding "six.moves" as a runtime module causes
+    #   ModuleGraph to ignore these submodules, which defeats the entire point.
+    # * Attributes imported from packages could be submodules. To disambiguate
+    #   non-ignorable submodules from ignorable non-submodules (e.g., classes,
+    #   variables), ModuleGraph first attempts to import these attributes as
+    #   submodules. This is exactly what we want.
+    if isinstance(real_to_six_module_name, str):
+        raise SystemExit("pre-safe-import-module hook failed, needs fixing.")
+    api.add_runtime_package(api.module_name)
     for real_module_name, six_module_name in real_to_six_module_name.items():
         api.add_alias_module(real_module_name, six_module_name)

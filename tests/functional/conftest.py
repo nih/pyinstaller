@@ -1,5 +1,5 @@
 #-----------------------------------------------------------------------------
-# Copyright (c) 2005-2016, PyInstaller Development Team.
+# Copyright (c) 2005-2019, PyInstaller Development Team.
 #
 # Distributed under the terms of the GNU General Public License with exception
 # for distributing bootloader.
@@ -30,6 +30,16 @@ import shutil
 # Third-party imports
 # -------------------
 import py
+import psutil # Manages subprocess timeout.
+
+
+# Set a handler for the root-logger to inhibit 'basicConfig()' (called in
+# PyInstaller.log) is setting up a stream handler writing to stderr. This
+# avoids log messages to be written (and captured) twice: once on stderr and
+# once by pytests's caplog.
+import logging
+logging.getLogger().addHandler(logging.NullHandler())
+
 
 # Local imports
 # -------------
@@ -41,9 +51,16 @@ from PyInstaller import configure, config
 from PyInstaller import __main__ as pyi_main
 from PyInstaller.utils.cliutils import archive_viewer
 from PyInstaller.compat import is_darwin, is_win, is_py2, safe_repr, \
-  architecture
+    architecture, is_linux, suppress, text_read_mode
 from PyInstaller.depend.analysis import initialize_modgraph
 from PyInstaller.utils.win32 import winutils
+from PyInstaller.utils.hooks.qt import pyqt5_library_info
+
+# Monkeypatch the psutil subprocess on Python 2
+if is_py2:
+    import subprocess32
+    psutil.subprocess = subprocess32
+    subprocess.TimeoutExpired = psutil.TimeoutExpired
 
 # Globals
 # =======
@@ -57,11 +74,30 @@ _LOGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
 _DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
 # Directory with .spec files used in some tests.
 _SPEC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'specs')
+# Timeout for running the executable. If executable does not exit in this time
+# then it is interpreted as test failure.
+_EXE_TIMEOUT = 30  # In sec.
+# Number of retries we should attempt if the executable times out.
+_MAX_RETRIES = 2
 
 # Code
 # ====
 # Fixtures
 # --------
+
+
+@pytest.hookimpl(tryfirst=True, hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    # execute all other hooks to obtain the report object
+    outcome = yield
+    rep = outcome.get_result()
+
+    # set an report attribute for each phase of a call, which can
+    # be "setup", "call", "teardown"
+
+    setattr(item, "rep_" + rep.when, rep)
+
+
 @pytest.fixture
 def script_dir():
     return py.path.local(_SCRIPT_DIR)
@@ -115,6 +151,7 @@ class AppBuilder(object):
         """
         Test a Python script that is referenced in the supplied .spec file.
         """
+        __tracebackhide__ = True
         specfile = os.path.join(_SPEC_DIR, specfile)
         # 'test_script' should handle .spec properly as script.
         return self.test_script(specfile, *args, **kwargs)
@@ -141,9 +178,10 @@ class AppBuilder(object):
         All other arguments are passed streigth on to `test_script`.
 
         Ensure that the caller of `test_source` is in a UTF-8
-        encoded file with the correct "# -*- coding: utf-8 -*-" marker.
+        encoded file with the correct '# -*- coding: utf-8 -*-' marker.
 
         """
+        __tracebackhide__ = True
         if is_py2:
             if isinstance(source, str):
                 source = source.decode('UTF-8')
@@ -152,6 +190,9 @@ class AppBuilder(object):
             # For parametrized test append the test-id.
             testname = testname + '__' + kwargs['test_id']
             del kwargs['test_id']
+
+        # Periods are not allowed in Python module names.
+        testname = testname.replace('.', '_')
 
         scriptfile = os.path.join(os.path.abspath(self._tmpdir),
                                   testname + '.py')
@@ -171,9 +212,17 @@ class AppBuilder(object):
         :param pyi_args: Additional arguments to pass to PyInstaller when creating executable.
         :param app_name: Name of the executable. This is equivalent to argument --name=APPNAME.
         :param app_args: Additional arguments to pass to
-        :param runtime: Time in milliseconds how long to keep executable running.
+        :param runtime: Time in seconds how long to keep executable running.
         :param toc_log: List of modules that are expected to be bundled with the executable.
         """
+        __tracebackhide__ = True
+
+        def marker(line):
+            # Print some marker to stdout and stderr to make it easier
+            # to distinguish the phases in the CI test output.
+            print('-------', line, '-------')
+            print('-------', line, '-------', file=sys.stderr)
+
         if pyi_args is None:
             pyi_args = []
         if app_args is None:
@@ -191,9 +240,14 @@ class AppBuilder(object):
         self.script = script
         assert os.path.exists(self.script), 'Script %s not found.' % script
 
-        assert self._test_building(args=pyi_args), 'Building of %s failed.' % script
+        marker('Starting build.')
+        if not self._test_building(args=pyi_args):
+            pytest.fail('Building of %s failed.' % script)
+
+        marker('Build finshed, now running executable.')
         self._test_executables(app_name, args=app_args,
                                runtime=runtime, run_from_path=run_from_path)
+        marker('Running executable finished.')
 
     def _test_executables(self, name, args, runtime, run_from_path):
         """
@@ -203,11 +257,11 @@ class AppBuilder(object):
         them have to be run.
 
         :param args: CLI options to pass to the created executable.
-        :param runtime: Time in miliseconds how long to keep the executable running.
+        :param runtime: Time in seconds how long to keep the executable running.
 
         :return: Exit code of the executable.
         """
-        # TODO implement runtime - kill the app (Ctrl+C) when time times out
+        __tracebackhide__ = True
         exes = self._find_executables(name)
         # Empty list means that PyInstaller probably failed to create any executable.
         assert exes != [], 'No executable file was found.'
@@ -215,9 +269,12 @@ class AppBuilder(object):
             # Try to find .toc log file. .toc log file has the same basename as exe file.
             toc_log = os.path.join(_LOGS_DIR, os.path.basename(exe) + '.toc')
             if os.path.exists(toc_log):
-                assert self._examine_executable(exe, toc_log), 'Matching .toc of %s failed.' % exe
+                if not self._examine_executable(exe, toc_log):
+                    pytest.fail('Matching .toc of %s failed.' % exe)
             retcode = self._run_executable(exe, args, run_from_path, runtime)
-            assert retcode == 0, 'Running exe %s failed with return-code %s.' % (exe, retcode)
+            if retcode != 0:
+                pytest.fail('Running exe %s failed with return-code %s.' %
+                            (exe, retcode))
 
     def _find_executables(self, name):
         """
@@ -301,25 +358,58 @@ class AppBuilder(object):
                 prog_cwd = prog_cwd.encode('mbcs')
 
         args = [prog_name] + args
-        # Run executable. stderr is redirected to stdout.
-        print('RUNNING: ', safe_repr(exe_path), ", args: ", safe_repr(args))
-
         # Using sys.stdout/sys.stderr for subprocess fixes printing messages in
         # Windows command prompt. Py.test is then able to collect stdout/sterr
         # messages and display them if a test fails.
-        if is_py2:  # Timeout keyword supported only in Python 3.3+
-            # TODO use module 'subprocess32' which implements timeout for Python 2.7.
-            retcode = subprocess.call(args, executable=exe_path, stdout=sys.stdout,
-                                      stderr=sys.stderr, env=prog_env, cwd=prog_cwd)
-        else:
-            try:
-                retcode = subprocess.call(args, executable=exe_path, stdout=sys.stdout, stderr=sys.stderr,
-                                      env=prog_env, cwd=prog_cwd, timeout=runtime)
-            except subprocess.TimeoutExpired:
-                # When 'timeout' is set then expired timeout is a good sing
+        for _ in range(_MAX_RETRIES):
+            retcode = self.__run_executable(args, exe_path, prog_env,
+                                            prog_cwd, runtime)
+            if retcode != 1:  # retcode == 1 means a timeout
+                break
+        return retcode
+
+
+    def __run_executable(self, args, exe_path, prog_env, prog_cwd, runtime):
+        process = psutil.Popen(args, executable=exe_path,
+                               stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE,
+                               env=prog_env, cwd=prog_cwd)
+
+        def _msg(*text):
+            print('[' + str(process.pid) + '] ', *text)
+
+        # Run executable. stderr is redirected to stdout.
+        _msg('RUNNING: ', safe_repr(exe_path), ', args: ', safe_repr(args))
+        # 'psutil' allows to use timeout in waiting for a subprocess.
+        # If not timeout was specified then it is 'None' - no timeout, just waiting.
+        # Runtime is useful mostly for interactive tests.
+        try:
+            timeout = runtime if runtime else _EXE_TIMEOUT
+            stdout, stderr = process.communicate(timeout=timeout)
+            retcode = process.returncode
+        except (psutil.TimeoutExpired, subprocess.TimeoutExpired):
+            if runtime:
+                # When 'runtime' is set then expired timeout is a good sing
                 # that the executable was running successfully for a specified time.
                 # TODO Is there a better way return success than 'retcode = 0'?
                 retcode = 0
+            else:
+                # Exe is running and it is not interactive. Fail the test.
+                retcode = 1
+                _msg('TIMED OUT!')
+            # Kill the subprocess and its child processes.
+            for p in list(process.children(recursive=True)) + [process]:
+                with suppress(psutil.NoSuchProcess):
+                    p.kill()
+            stdout, stderr = process.communicate()
+
+        if is_py2:
+            sys.stdout.write(stdout)
+            sys.stderr.write(stderr)
+        else:
+            sys.stdout.buffer.write(stdout)
+            sys.stderr.buffer.write(stderr)
+
         return retcode
 
     def _test_building(self, args):
@@ -330,12 +420,13 @@ class AppBuilder(object):
 
         Return True if build succeded False otherwise.
         """
-        default_args = ['--debug', '--noupx',
+        default_args = ['--debug=bootloader', '--noupx',
                 '--specpath', self._specdir,
                 '--distpath', self._distdir,
                 '--workpath', self._builddir,
-                '--path', _MODULES_DIR]
-        default_args.extend(['--debug', '--log-level=DEBUG'])
+                '--path', _MODULES_DIR,
+                '--log-level=DEBUG'
+                ]
 
         # Choose bundle mode.
         if self._mode == 'onedir':
@@ -366,7 +457,7 @@ class AppBuilder(object):
         print('EXECUTING MATCHING:', toc_log)
         fname_list = archive_viewer.get_archive_content(exe)
         fname_list = [fn for fn in fname_list]
-        with open(toc_log, 'rU') as f:
+        with open(toc_log, text_read_mode) as f:
             pattern_list = eval(f.read())
         # Alphabetical order of patterns.
         pattern_list.sort()
@@ -396,6 +487,11 @@ class AppBuilder(object):
 # for every executable.
 @pytest.fixture(scope='session')
 def pyi_modgraph():
+    # Explicitly set the log level since the plugin `pytest-catchlog` (un-)
+    # sets the root logger's level to NOTSET for the setup phase, which will
+    # lead to TRACE messages been written out.
+    import PyInstaller.log as logging
+    logging.logger.setLevel(logging.DEBUG)
     return initialize_modgraph()
 
 
@@ -415,7 +511,18 @@ def pyi_builder(tmpdir, monkeypatch, request, pyi_modgraph):
     # The value is same as the original value.
     monkeypatch.setattr('PyInstaller.config.CONF', {'pathex': []})
 
-    return AppBuilder(tmp, request.param, pyi_modgraph)
+    yield AppBuilder(tmp, request.param, pyi_modgraph)
+
+    if is_darwin or is_linux:
+        if request.node.rep_setup.passed:
+            if request.node.rep_call.passed:
+                if os.path.exists(tmp):
+                    shutil.rmtree(tmp)
+    # Clear any PyQt5 state.
+    try:
+        del pyqt5_library_info.version
+    except AttributeError:
+        pass
 
 
 # Fixture for .spec based tests.

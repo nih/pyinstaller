@@ -1,5 +1,5 @@
 #-----------------------------------------------------------------------------
-# Copyright (c) 2005-2016, PyInstaller Development Team.
+# Copyright (c) 2005-2019, PyInstaller Development Team.
 #
 # Distributed under the terms of the GNU General Public License with exception
 # for distributing bootloader.
@@ -15,4 +15,4 @@ from PyInstaller.utils.hooks import collect_submodules
 
 # Include all PIL image plugins - module names containing 'ImagePlugin'.
 # e.g.  PIL.JpegImagePlugin
-hiddenimports = collect_submodules('PIL', pattern='ImagePlugin')
+hiddenimports = collect_submodules('PIL', lambda name: 'ImagePlugin' in name)

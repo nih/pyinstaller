@@ -1,5 +1,5 @@
 #-----------------------------------------------------------------------------
-# Copyright (c) 2005-2016, PyInstaller Development Team.
+# Copyright (c) 2005-2019, PyInstaller Development Team.
 #
 # Distributed under the terms of the GNU General Public License with exception
 # for distributing bootloader.
@@ -8,7 +8,7 @@
 #-----------------------------------------------------------------------------
 
 # This contains tests for the class:``Tree``, see
-# https://pythonhosted.org/PyInstaller/#the-tree-class
+# https://pyinstaller.readthedocs.io/en/latest/advanced-topics.html#the-tree-class
 
 import os
 import pytest

@@ -1,5 +1,5 @@
 #-----------------------------------------------------------------------------
-# Copyright (c) 2005-2016, PyInstaller Development Team.
+# Copyright (c) 2005-2019, PyInstaller Development Team.
 #
 # Distributed under the terms of the GNU General Public License with exception
 # for distributing bootloader.
@@ -8,10 +8,10 @@
 #-----------------------------------------------------------------------------
 
 
-from PyInstaller.utils.hooks import qt4_plugins_binaries
+from PyInstaller.utils.hooks import qt_plugins_binaries
 
 hiddenimports = ['PySide.QtCore']
 
 binaries = []
 for plug in ('accessible', 'iconengines', 'imageformats', 'inputmethods', 'graphicssystems'):
-    binaries.extend(qt4_plugins_binaries(plug, ns='PySide'))
+    binaries.extend(qt_plugins_binaries(plug, namespace='PySide'))

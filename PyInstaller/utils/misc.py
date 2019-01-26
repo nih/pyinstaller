@@ -1,5 +1,5 @@
 #-----------------------------------------------------------------------------
-# Copyright (c) 2013-2016, PyInstaller Development Team.
+# Copyright (c) 2013-2019, PyInstaller Development Team.
 #
 # Distributed under the terms of the GNU General Public License with exception
 # for distributing bootloader.
@@ -13,14 +13,13 @@ This module is for the miscellaneous routines which do not fit somewhere else.
 """
 
 import glob
-import imp
 import os
 import pprint
 import py_compile
 import sys
 
 from PyInstaller import log as logging
-from PyInstaller.compat import is_unix, is_win, BYTECODE_MAGIC, is_py2
+from PyInstaller.compat import BYTECODE_MAGIC, is_py2, text_read_mode
 
 logger = logging.getLogger(__name__)
 
@@ -35,10 +34,14 @@ def dlls_in_subdirs(directory):
 
 def dlls_in_dir(directory):
     """Returns a list of *.dll, *.so, *.dylib in given directory."""
+    return files_in_dir(directory, ["*.so", "*.dll", "*.dylib"])
+
+
+def files_in_dir(directory, file_patterns=[]):
+    """Returns a list of files which match a pattern in given directory."""
     files = []
-    files.extend(glob.glob(os.path.join(directory, '*.so')))
-    files.extend(glob.glob(os.path.join(directory, '*.dll')))
-    files.extend(glob.glob(os.path.join(directory, '*.dylib')))
+    for file_pattern in file_patterns:
+        files.extend(glob.glob(os.path.join(directory, file_pattern)))
     return files
 
 
@@ -56,27 +59,6 @@ def get_unicode_modules():
         logger.error("Cannot detect modules 'codecs'.")
 
     return modules
-
-
-def get_code_object(filename, new_filename=None):
-    """
-    Convert source code from Python source file to code object.
-
-        new_filename  File name that the code should be compiled with.
-    """
-    try:
-        # with statement will close the file automatically.
-        with open(filename, 'rU') as fp:
-            source_code_string = fp.read() + '\n'
-        # Sometimes you might need to change the filename in the code object.
-        if new_filename:
-            filename = new_filename
-        code_object = compile(source_code_string, filename, 'exec', 0, True)
-        return code_object
-    except SyntaxError as e:
-        logger.error("SyntaxError while compiling code object for %s",
-                     filename, exc_info=True)
-        raise SystemExit(10)
 
 
 def get_path_to_toplevel_modules(filename):
@@ -121,7 +103,7 @@ def compile_py_files(toc, workpath):
     Given a TOC or equivalent list of tuples, generates all the required
     pyc/pyo files, writing in a local directory if required, and returns the
     list of tuples with the updated pathnames.
-    
+
     In the old system using ImpTracker, the generated TOC of "pure" modules
     already contains paths to nm.pyc or nm.pyo and it is only necessary
     to check that these files are not older than the source.
@@ -163,10 +145,10 @@ def compile_py_files(toc, workpath):
         # instead of just read(4)? Yes for many a .pyc file, it is all
         # in one sector so there's no difference in I/O but still it
         # seems inelegant to copy it all then subscript 4 bytes.
-        needs_compile = ( (mtime(src_fnm) > mtime(obj_fnm) )
-                          or
-                          (open(obj_fnm, 'rb').read()[:4] != BYTECODE_MAGIC)
-                        )
+        needs_compile = mtime(src_fnm) > mtime(obj_fnm)
+        if not needs_compile:
+            with open(obj_fnm, 'rb') as fh:
+                needs_compile = fh.read()[:4] != BYTECODE_MAGIC
         if needs_compile:
             try:
                 # TODO: there should be no need to repeat the compile,
@@ -197,9 +179,10 @@ def compile_py_files(toc, workpath):
 
                 obj_fnm = os.path.join(leading, mod_name + ext)
                 # TODO see above regarding read()[:4] versus read(4)
-                needs_compile = (mtime(src_fnm) > mtime(obj_fnm)
-                                 or
-                                 open(obj_fnm, 'rb').read()[:4] != BYTECODE_MAGIC)
+                needs_compile = mtime(src_fnm) > mtime(obj_fnm)
+                if not needs_compile:
+                    with open(obj_fnm, 'rb') as fh:
+                        needs_compile = fh.read()[:4] != BYTECODE_MAGIC
                 if needs_compile:
                     # TODO see above todo regarding using node.code
                     py_compile.compile(src_fnm, obj_fnm)
@@ -237,9 +220,9 @@ def load_py_data_struct(filename):
     """
     if is_py2:
         import codecs
-        f = codecs.open(filename, 'rU', encoding='utf-8')
+        f = codecs.open(filename, text_read_mode, encoding='utf-8')
     else:
-        f = open(filename, 'rU', encoding='utf-8')
+        f = open(filename, text_read_mode, encoding='utf-8')
     with f:
         # Binding redirects are stored as a named tuple, so bring the namedtuple
         # class into scope for parsing the TOC.
@@ -250,3 +233,21 @@ def load_py_data_struct(filename):
 
 def absnormpath(apath):
     return os.path.abspath(os.path.normpath(apath))
+
+
+def module_parent_packages(full_modname):
+    """
+    Return list of parent package names.
+        'aaa.bb.c.dddd' ->  ['aaa', 'aaa.bb', 'aaa.bb.c']
+    :param full_modname: Full name of a module.
+    :return: List of parent module names.
+    """
+    prefix = ''
+    parents = []
+    # Ignore the last component in module name and get really just
+    # parent, grand parent, grandgrand parent, etc.
+    for pkg in full_modname.split('.')[0:-1]:
+        # Ensure first item does not start with dot '.'
+        prefix += '.' + pkg if prefix else pkg
+        parents.append(prefix)
+    return parents

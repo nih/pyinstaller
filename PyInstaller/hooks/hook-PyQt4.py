@@ -1,5 +1,5 @@
 #-----------------------------------------------------------------------------
-# Copyright (c) 2013-2016, PyInstaller Development Team.
+# Copyright (c) 2013-2019, PyInstaller Development Team.
 #
 # Distributed under the terms of the GNU General Public License with exception
 # for distributing bootloader.
@@ -10,7 +10,7 @@
 
 import os
 
-from PyInstaller.utils.hooks import qt4_menu_nib_dir
+from PyInstaller.utils.hooks import qt_menu_nib_dir
 from PyInstaller.compat import getsitepackages, is_darwin, is_win
 
 
@@ -30,5 +30,5 @@ hiddenimports = ['sip']
 # app.
 if is_darwin:
     datas = [
-        (qt4_menu_nib_dir(), ''),
+        (qt_menu_nib_dir('PyQt4'), 'qt_menu.nib'),
     ]

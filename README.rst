@@ -6,44 +6,12 @@ package. The user can run the packaged app without installing a Python
 interpreter or any modules.
 
 
-.. image:: https://img.shields.io/travis/pyinstaller/pyinstaller/develop.svg?label=Linux
-   :target: https://travis-ci.org/pyinstaller/pyinstaller/
-   :alt: Travis CI test status (Linux)
-
-.. image:: https://img.shields.io/travis/pyinstaller/pyinstaller-osx-tests/master.svg?label=OS%20X
-   :target: https://travis-ci.org/pyinstaller/pyinstaller-osx-tests
-   :alt: Travis CI test status (OS X)
-
-.. image:: https://img.shields.io/appveyor/ci/matysek/pyinstaller/develop.svg?label=Windows
-   :target: https://ci.appveyor.com/project/matysek/pyinstaller/branch/develop
-   :alt: AppVeyor CI test status (Windows)
-
-.. image:: https://landscape.io/github/pyinstaller/pyinstaller/develop/landscape.svg?
-   :target: https://landscape.io/github/pyinstaller/pyinstaller/develop
-   :alt: Code health
-
-.. image:: https://img.shields.io/pypi/v/PyInstaller.svg
-   :target: https://pypi.python.org/pypi/PyInstaller
-
-.. image:: https://img.shields.io/pypi/dm/PyInstaller.svg
-   :target: https://pypi.python.org/pypi/PyInstaller
-
-.. image:: https://img.shields.io/badge/docs-latest-blue.svg
-   :target: http://htmlpreview.github.io/?https://github.com/pyinstaller/pyinstaller/blob/develop/doc/Manual.html
-   :alt: Manual
-
-.. image:: https://img.shields.io/badge/changes-latest-blue.svg
-   :target: https://github.com/pyinstaller/pyinstaller/blob/develop/doc/CHANGES.rst
-   :alt: Changelog
-
-.. image:: https://img.shields.io/badge/IRC-pyinstalller-blue.svg
-   :target: http://webchat.freenode.net/?channels=%23pyinstaller&uio=d4
-   :alt: IRC
-
-
-:Documentation: https://pythonhosted.org/PyInstaller/
-:Website:       http://www.pyinstaller.org
+:Documentation: https://pyinstaller.readthedocs.io/
+:Website:       http://www.pyinstaller.org/
 :Code:          https://github.com/pyinstaller/pyinstaller
+:Donate:        | https://www.bountysource.com/teams/pyinstaller
+                | Bitcoin: 1JUFjawzWDR7Tc8z9TKXstVFdjkDY9FbtK
+                | `more ways to donate … <http://www.pyinstaller.org/donate.html>`_
 
 
 PyInstaller reads a Python script written by you. It analyzes your code
@@ -53,16 +21,18 @@ Python interpreter! -- and puts them with your script in a single folder, or
 optionally in a single executable file.
 
 
-PyInstaller is tested against Windows, Mac OS X, and Linux. However, it is not
-a cross-compiler: to make a Windows app you run PyInstaller in Windows; to make
-a Linux app you run it in Linux, etc. PyInstaller has been used successfully
+PyInstaller is tested against Windows, Mac OS X, and GNU/Linux.
+However, it is not a cross-compiler:
+to make a Windows app you run PyInstaller in Windows; to make
+a GNU/Linux app you run it in GNU/Linux, etc.
+PyInstaller has been used successfully
 with AIX, Solaris, and FreeBSD, but is not tested against them.
 
 
 Main Advantages
 ---------------
 
-- Works out-of-the-box with any Python version 2.7 / 3.3-3.5.
+- Works out-of-the-box with any Python version 2.7 / 3.4-3.7.
 - Fully multi-platform, and uses the OS support to load the dynamic libraries,
   thus ensuring full compatibility.
 - Correctly bundles the major Python packages such as numpy, PyQt4, PyQt5,
@@ -88,14 +58,14 @@ Requirements and Tested Platforms
 
 - Python: 
 
- - 2.7 or 3.3+
+ - 2.7 or 3.4-3.7
  - PyCrypto_ 2.4+ (only if using bytecode encryption)
 
 - Windows (32bit/64bit):
 
  - Windows XP or newer.
     
-- Linux (32bit/64bit)
+- GNU/Linux (32bit/64bit)
 
  - ldd: Console application to print the shared libraries required
    by each program or shared library. This typically can be found in
@@ -103,10 +73,13 @@ Requirements and Tested Platforms
  - objdump: Console application to display information from 
    object files. This typically can be found in the
    distribution-package `binutils`.
+ - objcopy: Console application to copy and translate object files.
+   This typically can be found in the distribution-package `binutils`,
+   too.
 
 - Mac OS X (64bit):
 
- - Mac OS X 10.6 (Snow Leopard) or newer.
+ - Mac OS X 10.7 (Lion) or newer.
 
 
 Usage
@@ -140,6 +113,8 @@ enhancements on these are welcome.
    linked Python libraries.
  - ldd
 
+- PowerPC GNU/Linux (Debian)
+
 
 Before using any contributed platform, you need to build the PyInstaller
 bootloader, as we do not ship binary packages. Download PyInstaller
@@ -157,5 +132,5 @@ or simply use it directly from the source (pyinstaller.py).
 
 
 .. _PyCrypto: https://www.dlitz.net/software/pycrypto/
-.. _`manual`: http://htmlpreview.github.io/?https://github.com/pyinstaller/pyinstaller/blob/develop/doc/Manual.html
+.. _`manual`: https://pyinstaller.readthedocs.io/en/latest/
 

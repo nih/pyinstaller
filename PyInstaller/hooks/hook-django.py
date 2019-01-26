@@ -1,5 +1,5 @@
 #-----------------------------------------------------------------------------
-# Copyright (c) 2005-2016, PyInstaller Development Team.
+# Copyright (c) 2005-2019, PyInstaller Development Team.
 #
 # Distributed under the terms of the GNU General Public License with exception
 # for distributing bootloader.
@@ -15,13 +15,15 @@ import sys
 import glob
 import os
 from PyInstaller import log as logging
-from PyInstaller.utils.hooks import django_find_root_dir, django_dottedstring_imports, \
-        collect_data_files, collect_submodules, get_module_file_attribute
+from PyInstaller.utils.hooks import (
+    django_find_root_dir, django_dottedstring_imports, collect_all,
+    collect_submodules, collect_data_files, get_module_file_attribute,
+    get_module_attribute)
 
 
 logger = logging.getLogger(__name__)
 
-hiddenimports = []
+datas, binaries, hiddenimports = collect_all('django')
 
 
 root_dir = django_find_root_dir()
@@ -43,19 +45,6 @@ if root_dir:
             package_name + '.urls',
             package_name + '.wsgi',
     ]
-    # Include some hidden modules that are not imported directly in django.
-    hiddenimports += [
-            'django.template.defaultfilters',
-            'django.template.defaulttags',
-            'django.template.loader_tags',
-            'django.template.context_processors',
-    ]
-    hiddenimports += collect_submodules('django.middleware')
-    hiddenimports += collect_submodules('django.templatetags')
-    # Other hidden imports to get Django example startproject working.
-    hiddenimports += [
-            'django.contrib.messages.storage.fallback',
-    ]
     # Django hiddenimports from the standard Python library.
     if sys.version_info.major == 3:
         # Python 3.x
@@ -70,29 +59,31 @@ if root_dir:
                 'HTMLParser',
         ]
 
-    # Include django data files - localizations, etc.
-    datas = collect_data_files('django')
-
     # Bundle django DB schema migration scripts as data files.
     # They are necessary for some commands.
     logger.info('Collecting Django migration scripts.')
-    django_mod_dir = os.path.dirname(get_module_file_attribute('django'))
     migration_modules = [
-             'conf.app_template.migrations',
-             'contrib.admin.migrations',
-             'contrib.auth.migrations',
-             'contrib.contenttypes.migrations',
-             'contrib.flatpages.migrations',
-             'contrib.redirects.migrations',
-             'contrib.sessions.migrations',
-             'contrib.sites.migrations',
+             'django.conf.app_template.migrations',
+             'django.contrib.admin.migrations',
+             'django.contrib.auth.migrations',
+             'django.contrib.contenttypes.migrations',
+             'django.contrib.flatpages.migrations',
+             'django.contrib.redirects.migrations',
+             'django.contrib.sessions.migrations',
+             'django.contrib.sites.migrations',
     ]
+    # Include migration scripts of Django-based apps too.
+    installed_apps = eval(get_module_attribute(package_name + '.settings', 'INSTALLED_APPS'))
+    migration_modules.extend(set(app + '.migrations' for app in installed_apps))
+    # Copy migration files.
     for mod in migration_modules:
-        bundle_dir = mod.replace('.', os.sep)
-        pattern = os.path.join(django_mod_dir, bundle_dir, '*.py')
+        mod_name, bundle_name = mod.split('.', 1)
+        mod_dir = os.path.dirname(get_module_file_attribute(mod_name))
+        bundle_dir = bundle_name.replace('.', os.sep)
+        pattern = os.path.join(mod_dir, bundle_dir, '*.py')
         files = glob.glob(pattern)
         for f in files:
-            datas.append((f, os.path.join('django', bundle_dir)))
+            datas.append((f, os.path.join(mod_name, bundle_dir)))
 
     # Include data files from your Django project found in your django root package.
     datas += collect_data_files(package_name)
@@ -109,4 +100,4 @@ if root_dir:
 
 
 else:
-    logger.warn('No django root directory could be found!')
+    logger.warning('No django root directory could be found!')

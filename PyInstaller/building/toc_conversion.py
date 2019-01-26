@@ -1,5 +1,5 @@
 #-----------------------------------------------------------------------------
-# Copyright (c) 2005-2016, PyInstaller Development Team.
+# Copyright (c) 2005-2019, PyInstaller Development Team.
 #
 # Distributed under the terms of the GNU General Public License with exception
 # for distributing bootloader.
@@ -13,17 +13,18 @@ import pkg_resources
 from ..depend.utils import get_path_to_egg
 from .datastruct import TOC, Tree
 from .. import log as logging
+from ..compat import ALL_SUFFIXES
 
 logger = logging.getLogger(__name__)
 
-
-# create a list of excludes suitable for Tree
-from ..utils.hooks import PY_IGNORE_EXTENSIONS, PY_EXECUTABLE_SUFFIXES
+# create a list of excludes suitable for Tree.
 PY_IGNORE_EXTENSIONS = set(
-    '*'+s for s in PY_IGNORE_EXTENSIONS | PY_EXECUTABLE_SUFFIXES)
-# Exclude EGG-INFO, too, as long as we do not have a way to hold several
-# in one archive
-PY_IGNORE_EXTENSIONS = PY_IGNORE_EXTENSIONS | set(['EGG-INFO'])
+    ['*' + x for x in ALL_SUFFIXES] +
+    # Exclude EGG-INFO, too, as long as we do not have a way to hold several
+    # in one archive
+    ['EGG-INFO']
+)
+
 
 class DependencyProcessor(object):
     """
@@ -132,7 +133,12 @@ class DependencyProcessor(object):
         # 'PyInstaller.config' cannot be imported as other top-level modules.
         from ..config import CONF
         workpath = os.path.join(CONF['workpath'], os.path.basename(zipfilename))
-        os.makedirs(workpath)
+        try:
+            os.makedirs(workpath)
+        except OSError as e:
+            import errno
+            if e.errno != errno.EEXIST:
+                raise
         # TODO extract only those file which whould then be included
         with zipfile.ZipFile(zipfilename) as zfh:
             zfh.extractall(workpath)

@@ -1,5 +1,5 @@
 #-----------------------------------------------------------------------------
-# Copyright (c) 2005-2016, PyInstaller Development Team.
+# Copyright (c) 2005-2019, PyInstaller Development Team.
 #
 # Distributed under the terms of the GNU General Public License with exception
 # for distributing bootloader.
@@ -28,6 +28,10 @@ import marshal
 import struct
 import sys
 import zlib
+if sys.version_info[0] == 2:
+    import thread
+else:
+    import _thread as thread
 
 
 # For decrypting Python modules.
@@ -39,6 +43,17 @@ PYZ_TYPE_MODULE = 0
 PYZ_TYPE_PKG = 1
 PYZ_TYPE_DATA = 2
 
+class FilePos(object):
+    """
+    This class keeps track of the file object representing and current position
+    in a file.
+    """
+    def __init__(self):
+        # The file object representing this file.
+        self.file = None
+        # The position in the file when it was last closed.
+        self.pos = 0
+
 
 class ArchiveFile(object):
     """
@@ -49,41 +64,51 @@ class ArchiveFile(object):
     def __init__(self, *args, **kwargs):
         self.args = args
         self.kwargs = kwargs
-        self.pos = 0
-        self.fd = None
-        self.__open()
+        self._filePos = {}
+
+    def local(self):
+        """
+        Return an instance of FilePos for the current thread. This is a crude
+        # re-implementation of threading.local, which isn't a built-in module
+        # and therefore isn't available.
+        """
+        ti = thread.get_ident()
+        if ti not in self._filePos:
+            self._filePos[ti] = FilePos()
+        return self._filePos[ti]
 
     def __getattr__(self, name):
         """
-        Auto open file when access member from file object
-        This function only call when member of name not exist in self
+        Make this class act like a file, by invoking most methods on its
+        underlying file object.
         """
-        assert self.fd
-        return getattr(self.fd, name)
-
-    def __open(self):
-        """
-        Open file and seek to pos record from last close
-        """
-        if self.fd is None:
-            self.fd = open(*self.args, **self.kwargs)
-            self.fd.seek(self.pos)
+        file = self.local().file
+        assert file
+        return getattr(file, name)
 
     def __enter__(self):
-        self.__open()
+        """
+        Open file and seek to pos record from last close.
+        """
+        # The file shouldn't be open yet.
+        fp = self.local()
+        assert not fp.file
+        # Open the file and seek to the last position.
+        fp.file = open(*self.args, **self.kwargs)
+        fp.file.seek(fp.pos)
 
     def __exit__(self, type, value, traceback):
-        assert self.fd
-        self.close()
+        """
+        Close file and record pos.
+        """
+        # The file should still be open.
+        fp = self.local()
+        assert fp.file
 
-    def close(self):
-        """
-        Close file and record pos
-        """
-        if self.fd is not None:
-            self.pos = self.fd.tell()
-            self.fd.close()
-            self.fd = None
+        # Close the file and record its position.
+        fp.pos = fp.file.tell()
+        fp.file.close()
+        fp.file = None
 
 
 class ArchiveReadError(RuntimeError):
@@ -122,10 +147,7 @@ class ArchiveReader(object):
             # We cannot use at this bootstrap stage importlib directly
             # but its frozen variant.
             import _frozen_importlib
-            if sys.version_info[1] <= 3:
-                # Python 3.3
-                self.pymagic = _frozen_importlib._MAGIC_BYTES
-            elif sys.version_info[1] == 4:
+            if sys.version_info[1] == 4:
                 # Python 3.4
                 self.pymagic = _frozen_importlib.MAGIC_NUMBER
             else:
@@ -158,6 +180,12 @@ class ArchiveReader(object):
     #XXX obsolete - imputil only code
     ##  def get_code(self, parent, modname, fqname):
     ##      pass
+
+    def is_package(self, name):
+        ispkg, pos = self.toc.get(name, (0, None))
+        if pos is None:
+            return None
+        return bool(ispkg)
 
     ####### Core method - Override as needed  #########
     def extract(self, name):
@@ -240,23 +268,33 @@ class Cipher(object):
 
         PyCrypto 2.4 and 2.6 uses different name of the AES extension.
         """
-        # Not-so-easy way: at bootstrap time we have to load the module from the
-        # temporary directory in a manner similar to pyi_importers.CExtensionImporter.
-        from pyimod03_importers import CExtensionImporter
-        importer = CExtensionImporter()
-        # NOTE: We _must_ call find_module first.
         # The _AES.so module exists only in PyCrypto 2.6 and later. Try to import
         # that first.
         modname = 'Crypto.Cipher._AES'
-        mod = importer.find_module(modname)
-        # Fallback to AES.so, which should be there in PyCrypto 2.4 and earlier.
-        if not mod:
-            modname = 'Crypto.Cipher.AES'
+
+        if sys.version_info[0] == 2:
+            # Not-so-easy way: at bootstrap time we have to load the module from the
+            # temporary directory in a manner similar to pyi_importers.CExtensionImporter.
+            from pyimod03_importers import CExtensionImporter
+            importer = CExtensionImporter()
+            # NOTE: We _must_ call find_module first.
             mod = importer.find_module(modname)
+            # Fallback to AES.so, which should be there in PyCrypto 2.4 and earlier.
             if not mod:
-                # Raise import error if none of the AES modules is found.
-                raise ImportError(modname)
-        mod = mod.load_module(modname)
+                modname = 'Crypto.Cipher.AES'
+                mod = importer.find_module(modname)
+                if not mod:
+                    # Raise import error if none of the AES modules is found.
+                    raise ImportError(modname)
+            mod = mod.load_module(modname)
+        else:
+            kwargs = dict(fromlist=['Crypto', 'Cipher'])
+            try:
+                mod = __import__(modname, **kwargs)
+            except ImportError:
+                modname = 'Crypto.Cipher.AES'
+                mod = __import__(modname, **kwargs)
+
         # Issue #1663: Remove the AES module from sys.modules list. Otherwise
         # it interferes with using 'Crypto.Cipher' module in users' code.
         if modname in sys.modules:
@@ -313,6 +351,12 @@ class ZlibArchiveReader(ArchiveReader):
             self.cipher = Cipher()
         except ImportError:
             self.cipher = None
+
+    def is_package(self, name):
+        (typ, pos, length) = self.toc.get(name, (0, None, 0))
+        if pos is None:
+            return None
+        return typ == PYZ_TYPE_PKG
 
     def extract(self, name):
         (typ, pos, length) = self.toc.get(name, (0, None, 0))

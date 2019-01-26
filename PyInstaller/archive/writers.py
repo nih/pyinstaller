@@ -1,5 +1,5 @@
 #-----------------------------------------------------------------------------
-# Copyright (c) 2005-2016, PyInstaller Development Team.
+# Copyright (c) 2005-2019, PyInstaller Development Team.
 #
 # Distributed under the terms of the GNU General Public License with exception
 # for distributing bootloader.
@@ -28,8 +28,11 @@ from types import CodeType
 import marshal
 import zlib
 
-from .readers import CArchiveReader, PYZ_TYPE_MODULE, PYZ_TYPE_PKG, PYZ_TYPE_DATA
-from ..compat import BYTECODE_MAGIC
+from PyInstaller.building.utils import get_code_object, strip_paths_in_code,\
+    fake_pyc_timestamp
+from PyInstaller.loader.pyimod02_archive import PYZ_TYPE_MODULE, PYZ_TYPE_PKG, \
+    PYZ_TYPE_DATA
+from ..compat import BYTECODE_MAGIC, is_py2
 
 
 class ArchiveWriter(object):
@@ -109,9 +112,9 @@ class ArchiveWriter(object):
         ispkg = pynm == '__init__'
         assert ext in ('.pyc', '.pyo')
         self.toc.append((nm, (ispkg, self.lib.tell())))
-        f = open(entry[1], 'rb')
-        f.seek(8)  # skip magic and timestamp
-        self.lib.write(f.read())
+        with open(entry[1], 'rb') as f:
+            f.seek(8)  # skip magic and timestamp
+            self.lib.write(f.read())
 
     def save_trailer(self, tocpos):
         """
@@ -245,6 +248,9 @@ class CTOC(object):
             # standard python modules only contain ascii-characters
             # (and standard shared libraries should have the same) and
             # thus the C-code still can handle this correctly.
+            if is_py2 and isinstance(nm, str):
+                nm = nm.decode(sys.getfilesystemencoding())
+
             nm = nm.encode('utf-8')
             nmlen = len(nm) + 1       # add 1 for a '\0'
             # align to 16 byte boundary so xplatform C can read
@@ -356,24 +362,23 @@ class CArchiveWriter(ArchiveWriter):
         (nm, pathnm, flag, typcd) = entry[:4]
         # FIXME Could we make the version 5 the default one?
         # Version 5 - allow type 'o' = runtime option.
+        code_data = None
+        fh = None
         try:
             if typcd in ('o', 'd'):
-                fh = None
                 ulen = 0
-                postfix = b''
                 flag = 0
             elif typcd == 's':
-                # If it's a source code file, add \0 terminator as it will be
-                # executed as-is by the bootloader.
-                # Must read this in binary-mode, too, because
-                # compression only accepts a binary stream. Further we
-                # do not process it here, so why decode?
-                fh = open(pathnm, 'rb')
-                postfix = b'\n\0'
-                ulen = os.fstat(fh.fileno()).st_size + len(postfix)
+                # If it's a source code file, compile it to a code object and marshall
+                # the object so it can be unmarshalled by the bootloader.
+
+                code = get_code_object(nm, pathnm)
+                code = strip_paths_in_code(code)
+
+                code_data = marshal.dumps(code)
+                ulen = len(code_data)
             else:
                 fh = open(pathnm, 'rb')
-                postfix = b''
                 ulen = os.fstat(fh.fileno()).st_size
         except IOError:
             print("Cannot find ('%s', '%s', %s, '%s')" % (nm, pathnm, flag, typcd))
@@ -381,32 +386,45 @@ class CArchiveWriter(ArchiveWriter):
 
         where = self.lib.tell()
         assert flag in range(3)
-        if not fh:
+        if not fh and not code_data:
             # no need to write anything
             pass
         elif flag == 1:
-            assert fh
             comprobj = zlib.compressobj(self.LEVEL)
-            while 1:
-                buf = fh.read(16*1024)
-                if not buf:
-                    break
-                self.lib.write(comprobj.compress(buf))
-            self.lib.write(comprobj.compress(postfix))
+            if code_data is not None:
+                self.lib.write(comprobj.compress(code_data))
+            else:
+                assert fh
+                # We only want to change it for pyc files
+                modify_header = typcd in ('M', 'm', 's')
+                while 1:
+                    buf = fh.read(16*1024)
+                    if not buf:
+                        break
+                    if modify_header:
+                        modify_header = False
+                        buf = fake_pyc_timestamp(buf)
+                    self.lib.write(comprobj.compress(buf))
             self.lib.write(comprobj.flush())
+
         else:
-            assert fh
-            while 1:
-                buf = fh.read(16*1024)
-                if not buf:
-                    break
-                self.lib.write(buf)
-            self.lib.write(postfix)
+            if code_data is not None:
+                self.lib.write(code_data)
+            else:
+                assert fh
+                while 1:
+                    buf = fh.read(16*1024)
+                    if not buf:
+                        break
+                    self.lib.write(buf)
 
         dlen = self.lib.tell() - where
         if typcd == 'm':
             if pathnm.find('.__init__.py') > -1:
                 typcd = 'M'
+
+        if fh:
+            fh.close()
 
         # Record the entry in the CTOC
         self.toc.add(where, dlen, ulen, flag, typcd, nm)

@@ -1,5 +1,5 @@
 #-----------------------------------------------------------------------------
-# Copyright (c) 2005-2016, PyInstaller Development Team.
+# Copyright (c) 2005-2019, PyInstaller Development Team.
 #
 # Distributed under the terms of the GNU General Public License with exception
 # for distributing bootloader.
@@ -14,10 +14,7 @@ Configure PyInstaller for the current Python installation.
 
 import os
 
-import sys
-import time
-
-from . import  compat
+from . import compat
 from . import log as logging
 from .compat import is_win, is_darwin
 
@@ -32,7 +29,8 @@ def test_UPX(config, upx_dir):
 
     hasUPX = 0
     try:
-        vers = compat.exec_command(cmd, '-V').strip().splitlines()
+        vers = compat.exec_command(
+            cmd, '-V', __raise_ENOENT__=True).strip().splitlines()
         if vers:
             v = vers[0].split()[1]
             hasUPX = tuple(map(int, v.split(".")))
@@ -79,10 +77,15 @@ def _get_pyinst_cache_dir():
     if old_cache_dir and not os.path.exists(cache_dir):
         old_cache_dir = os.path.join(old_cache_dir, 'pyinstaller')
         if os.path.exists(old_cache_dir):
+            parent_dir = os.path.dirname(cache_dir)
+            if not os.path.exists(parent_dir):
+                os.makedirs(parent_dir)
             os.rename(old_cache_dir, cache_dir)
     return cache_dir
 
 
+#FIXME: Rename to get_official_hooks_dir().
+#FIXME: Remove the "hook_type" parameter after unifying hook types.
 def get_importhooks_dir(hook_type=None):
     from . import PACKAGEPATH
     if not hook_type:

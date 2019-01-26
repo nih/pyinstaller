@@ -1,5 +1,5 @@
 #-----------------------------------------------------------------------------
-# Copyright (c) 2005-2016, PyInstaller Development Team.
+# Copyright (c) 2005-2019, PyInstaller Development Team.
 #
 # Distributed under the terms of the GNU General Public License with exception
 # for distributing bootloader.
@@ -7,6 +7,7 @@
 # The full license is in the file COPYING.txt, distributed with this software.
 #-----------------------------------------------------------------------------
 
+from __future__ import print_function
 
 """
 Build packages using spec files.
@@ -27,13 +28,14 @@ import sys
 from .. import HOMEPATH, DEFAULT_DISTPATH, DEFAULT_WORKPATH
 from .. import compat
 from .. import log as logging
-from ..utils.misc import absnormpath
-from ..compat import is_py2, is_win, PYDYLIB_NAMES, VALID_MODULE_TYPES
+from ..utils.misc import absnormpath, compile_py_files
+from ..compat import is_py2, is_win, PYDYLIB_NAMES, VALID_MODULE_TYPES, \
+    open_file, text_type, unicode_writer
 from ..depend import bindepend
 from ..depend.analysis import initialize_modgraph
 from .api import PYZ, EXE, COLLECT, MERGE
 from .datastruct import TOC, Target, Tree, _check_guts_eq
-from .imphook import AdditionalFilesCache, HooksCache, ImportHook
+from .imphook import AdditionalFilesCache, ModuleHookCache
 from .osx import BUNDLE
 from .toc_conversion import DependencyProcessor
 from .utils import _check_guts_toc_mtime, format_binaries_and_datas
@@ -54,6 +56,29 @@ rthooks = {}
 
 # place where the loader modules and initialization scripts live
 _init_code_path = os.path.join(HOMEPATH, 'PyInstaller', 'loader')
+
+IMPORT_TYPES = ['top-level', 'conditional', 'delayed', 'delayed, conditional',
+                'optional', 'conditional, optional', 'delayed, optional',
+                'delayed, conditional, optional']
+
+WARNFILE_HEADER = """\
+
+This file lists modules PyInstaller was not able to find. This does not
+necessarily mean this module is required for running you program. Python and
+Python 3rd-party packages include a lot of conditional or optional module. For
+example the module 'ntpath' only exists on Windows, whereas the module
+'posixpath' only exists on Posix systems.
+
+Types if import:
+* top-level: imported at the top-level - look at these first
+* conditional: imported within an if-statement
+* delayed: imported from within a function
+* optional: imported within a try-except-statement
+
+IMPORTANT: Do NOT post this list to the issue-tracker. Use it as a basis for
+           yourself tracking down the missing module. Thanks!
+
+"""
 
 
 def _old_api_error(obj_name):
@@ -96,7 +121,7 @@ class Analysis(Target):
             The pure Python modules.
     binaries
             The extensionmodules and their dependencies. The secondary dependecies
-            are filtered. On Windows files from C:\Windows are excluded by default.
+            are filtered. On Windows files from C:\\Windows are excluded by default.
             On Linux/Unix only system libraries from /lib or /usr/lib are excluded.
     datas
             Data-file dependencies. These are data-file that are found to be needed
@@ -115,7 +140,8 @@ class Analysis(Target):
 
     def __init__(self, scripts, pathex=None, binaries=None, datas=None,
                  hiddenimports=None, hookspath=None, excludes=None, runtime_hooks=None,
-                 cipher=None, win_no_prefer_redirects=False, win_private_assemblies=False):
+                 cipher=None, win_no_prefer_redirects=False, win_private_assemblies=False,
+                 noarchive=False):
         """
         scripts
                 A list of scripts specified as file names.
@@ -142,7 +168,9 @@ class Analysis(Target):
         win_private_assemblies
                 If True, changes all bundled Windows SxS Assemblies into Private
                 Assemblies to enforce assembly versions.
-
+        noarchive
+                If True, don't place source files in a archive, but keep them as
+                individual files.
         """
         super(Analysis, self).__init__()
         from ..config import CONF
@@ -154,7 +182,7 @@ class Analysis(Target):
             if not os.path.isabs(script):
                 script = os.path.join(spec_dir, script)
             if absnormpath(script) in self._old_scripts:
-                logger.warn('Ignoring obsolete auto-added script %s', script)
+                logger.warning('Ignoring obsolete auto-added script %s', script)
                 continue
             # Normalize script path.
             script = os.path.normpath(script)
@@ -192,8 +220,9 @@ class Analysis(Target):
             # Create a Python module which contains the decryption key which will
             # be used at runtime by pyi_crypto.PyiBlockCipher.
             pyi_crypto_key_path = os.path.join(CONF['workpath'], 'pyimod00_crypto_key.py')
-            with open(pyi_crypto_key_path, 'w') as f:
-                f.write('key = %r\n' % cipher.key)
+            with open_file(pyi_crypto_key_path, 'w', encoding='utf-8') as f:
+                f.write(text_type('# -*- coding: utf-8 -*-\n'
+                                  'key = %r\n' % cipher.key))
             logger.info('Adding dependencies on pyi_crypto.py module')
             self.hiddenimports.append(pyz_crypto.get_crypto_hiddenimports())
 
@@ -208,6 +237,8 @@ class Analysis(Target):
         self.binding_redirects = CONF['binding_redirects'] = []
         self.win_no_prefer_redirects = win_no_prefer_redirects
         self.win_private_assemblies = win_private_assemblies
+        self._python_version = sys.version
+        self.noarchive = noarchive
 
         self.__postinit__()
 
@@ -221,7 +252,7 @@ class Analysis(Target):
         if datas:
             logger.info("Appending 'datas' from .spec")
             for name, pth in format_binaries_and_datas(datas, workingdir=spec_dir):
-                self.binaries.append((name, pth, 'DATA'))
+                self.datas.append((name, pth, 'DATA'))
 
     _GUTS = (# input parameters
             ('inputs', _check_guts_eq),  # parameter `scripts`
@@ -237,6 +268,7 @@ class Analysis(Target):
             # additional hidden import
 
             #calculated/analysed values
+            ('_python_version', _check_guts_eq),
             ('scripts', _check_guts_toc_mtime),
             ('pure', lambda *args: _check_guts_toc_mtime(*args, **{'pyc': 1})),
             ('binaries', _check_guts_toc_mtime),
@@ -374,10 +406,34 @@ class Analysis(Target):
         if is_win:
             depmanifest.writeprettyxml()
 
-        # The first script in the analysis is the main user script. Its node is used as
-        # the "caller" node for all others. This gives a connected graph rather than
-        # a collection of unrelated trees, one for each of self.inputs.
-        # The list of scripts is in self.inputs, each as a normalized pathname.
+
+        #FIXME: For simplicity, move the following hook caching into a new
+        #PyiModuleGraph.cache_module_hooks() method and have the current
+        #"PyiModuleGraph" instance own the current "ModuleHookCache" instance.
+
+        ### Hook cache.
+        logger.info('Caching module hooks...')
+
+        # List of all directories containing hook scripts. Default hooks are
+        # listed before and hence take precedence over custom hooks.
+        module_hook_dirs = [get_importhooks_dir()]
+        if self.hookspath:
+            module_hook_dirs.extend(self.hookspath)
+
+        # Hook cache prepopulated with these lazy loadable hook scripts.
+        module_hook_cache = ModuleHookCache(
+            module_graph=self.graph, hook_dirs=module_hook_dirs)
+
+
+        ### Module graph.
+        #
+        # Construct the module graph of import relationships between modules
+        # required by this user's application. For each entry point (top-level
+        # user-defined Python script), all imports originating from this entry
+        # point are recursively parsed into a subgraph of the module graph. This
+        # subgraph is then connected to this graph's root node, ensuring
+        # imported module nodes will be reachable from the root node -- which is
+        # is (arbitrarily) chosen to be the first entry point's node.
 
         # List to hold graph nodes of scripts and runtime hooks in use order.
         priority_scripts = []
@@ -389,71 +445,79 @@ class Analysis(Target):
             priority_scripts.append(self.graph.run_script(script))
 
 
-        ### Handle hooks.
+        ### Post-graph hooks.
         #
-        # Iterate over import hooks and update ModuleGraph as needed.
+        # Run post-graph hooks for all modules imported by this user's
+        # application. For each iteration of the infinite "while" loop below:
         #
-        # 1. Iterate in infinite 'while' loop.
-        # 2. Apply all possible hooks in one 'while' iteration.
-        # 3. Remove applied hooks from the cache.
-        # 4. The infinite 'while' loop ends when:
-        #    a. hooks cache is empty
-        #    b. no new hook was applied in the 'while' iteration.
-        #
-        logger.info('Looking for import hooks ...')
-        hooks_cache = HooksCache(get_importhooks_dir())
-        # Custom import hooks
-        if self.hookspath:
-            hooks_cache.add_custom_paths(self.hookspath)
-        # Cache with attitional 'datas' and 'binaries' that were
-        # NOTE: This cache is necessary to later decide if those files belong to
-        #       to module which is reachable for top-level script. Or if these
-        #       files belong to a module from dead branch of the graph.
+        # 1. All hook() functions defined in cached hooks for imported modules
+        #    are called. This may result in new modules being imported (e.g., as
+        #    hidden imports) that were ignored earlier in the current iteration:
+        #    if this is the case, all hook() functions defined in cached hooks
+        #    for these modules will be called by the next iteration.
+        # 2. All cached hooks whose hook() functions were called are removed
+        #    from this cache. If this cache is empty, no hook() functions will
+        #    be called by the next iteration and this loop will be terminated.
+        # 3. If no hook() functions were called, this loop is terminated.
+        logger.info('Loading module hooks...')
+
+        # Cache of all external dependencies (e.g., binaries, datas) listed in
+        # hook scripts for imported modules.
         additional_files_cache = AdditionalFilesCache()
 
+        #FIXME: For orthogonality, move the following "while" loop into a new
+        #PyiModuleGraph.post_graph_hooks() method. The "PyiModuleGraph" class
+        #already handles all other hook types. Moreover, the graph node
+        #retrieval and type checking performed below are low-level operations
+        #best isolated into the "PyiModuleGraph" class itself.
+
+        # For each imported module, run this module's post-graph hooks if any.
         while True:
-            # This ensures that import hooks get applied only once.
-            applied_hooks = []  # Empty means no hook was applied.
+            # Set of the names of all imported modules whose post-graph hooks
+            # are run by this iteration, preventing the next iteration from re-
+            # running these hooks. If still empty at the end of this iteration,
+            # no post-graph hooks were run; thus, this loop will be terminated.
+            hooked_module_names = set()
 
-            # Iterate over hooks in cache.
-            for imported_name in hooks_cache:
+            # For each remaining hookable module and corresponding hooks...
+            for module_name, module_hooks in module_hook_cache.items():
+                # Graph node for this module if imported or "None" otherwise.
+                module_node = self.graph.findNode(
+                    module_name, create_nspkg=False)
 
-                # Skip hook if no module for it is in the graph.
-                from_node = self.graph.findNode(imported_name, create_nspkg=False)
-                if from_node is None:
+                # If this module has not been imported, temporarily ignore it.
+                # This module is retained in the cache, as a subsequently run
+                # post-graph hook could import this module as a hidden import.
+                if module_node is None:
                     continue
-                # Skip hook if not the right Node type.
-                node_type = type(from_node).__name__
-                if node_type not in VALID_MODULE_TYPES:
+
+                # If this module is unimportable, permanently ignore it.
+                if type(module_node).__name__ not in VALID_MODULE_TYPES:
+                    hooked_module_names.add(module_name)
                     continue
 
-                # Run all post-graph hooks for this module.
-                for hook_file in hooks_cache[imported_name]:
-                    # Import hook module from a file.
-                    imphook_object = ImportHook(imported_name, hook_file)
-                    # Expand module dependency graph.
-                    imphook_object.update_dependencies(self.graph)
-                    # Update cache of binaries and datas.
-                    additional_files_cache.add(imported_name, imphook_object.binaries, imphook_object.datas)
+                # For each hook script for this module...
+                for module_hook in module_hooks:
+                    # Run this script's post-graph hook if any.
+                    module_hook.post_graph()
 
-                # Append applied hooks to the list 'applied_hooks'.
-                # These will be removed after the inner loop finishs.
-                # It also is a marker that iteration over hooks should
-                # continue.
-                applied_hooks.append(imported_name)
+                    # Cache all external dependencies listed by this script
+                    # after running this hook, which could add dependencies.
+                    additional_files_cache.add(
+                        module_name,
+                        module_hook.binaries,
+                        module_hook.datas)
 
-            ### All hooks from cache were traversed - stop or run again.
-            if not applied_hooks:  # Empty list.
-                # No new hook was applied - END of hooks processing.
+                # Prevent this module's hooks from being run again.
+                hooked_module_names.add(module_name)
+
+            # Prevent all post-graph hooks run above from being run again by the
+            # next iteration.
+            module_hook_cache.remove_modules(*hooked_module_names)
+
+            # If no post-graph hooks were run, terminate iteration.
+            if not hooked_module_names:
                 break
-            else:
-                # Remove applied hooks from the cache - its not
-                # necessary apply then again.
-                hooks_cache.remove(applied_hooks)
-                # Run again - reset list 'applied_hooks'.
-                applied_hooks = []
-
-
 
         # Update 'binaries' TOC and 'datas' TOC.
         deps_proc = DependencyProcessor(self.graph, additional_files_cache)
@@ -515,6 +579,26 @@ class Analysis(Target):
             self.binding_redirects[:] = list(set(self.binding_redirects))
             logger.info("Found binding redirects: \n%s", self.binding_redirects)
 
+        # Place Python source in data files for the noarchive case.
+        if self.noarchive:
+            # Create a new TOC of ``(dest path for .pyc, source for .py, type)``.
+            new_toc = TOC()
+            for name, path, typecode in self.pure:
+                assert typecode == 'PYMODULE'
+                # Transform a python module name into a file name.
+                name = name.replace('.', os.sep)
+                # Special case: modules have an implied filename to add.
+                if os.path.splitext(os.path.basename(path))[0] == '__init__':
+                    name += os.sep + '__init__'
+                # Append the extension for the compiled result.
+                name += '.py' + ('o' if sys.flags.optimize else 'c')
+                new_toc.append((name, path, typecode))
+            # Put the result of byte-compiling this TOC in datas. Mark all entries as data.
+            for name, path, typecode in compile_py_files(new_toc, CONF['workpath']):
+                self.datas.append((name, path, 'DATA'))
+            # Store no source in the archive.
+            self.pure = TOC()
+
         # Write warnings about missing modules.
         self._write_warnings()
         # Write debug information about hte graph
@@ -525,40 +609,43 @@ class Analysis(Target):
         Write warnings about missing modules. Get them from the graph
         and use the graph to figure out who tried to import them.
         """
-        # TODO: previously we could say whether an import was top-level,
-        # deferred (in a def'd function) or conditional (in an if stmt).
-        # That information is not available from ModuleGraph at this time.
-        # When that info is available change this code to write one line for
-        # each importer-name, with type of import for that importer
-        # "no module named foo conditional/deferred/toplevel importy by bar"
+        def dependency_description(name, depInfo):
+            if not depInfo or depInfo == 'direct':
+                imptype = 0
+            else:
+                imptype = (depInfo.conditional
+                           + 2 * depInfo.function
+                           + 4 * depInfo.tryexcept)
+            return '%s (%s)' % (name, IMPORT_TYPES[imptype])
+
         from ..config import CONF
         miss_toc = self.graph.make_missing_toc()
-        if len(miss_toc) : # there are some missing modules
-            wf = open(CONF['warnfile'], 'w')
-            for (n, p, status) in miss_toc :
-                importer_names = self.graph.importer_names(n)
-                wf.write( status
-                          + ' module named '
-                          + n
-                          + ' - imported by '
-                          + ', '.join(importer_names)
-                          + '\n'
-                          )
-            wf.close()
-            logger.info("Warnings written to %s", CONF['warnfile'])
+        with open_file(CONF['warnfile'], 'w', encoding='utf-8') as wf:
+            wf_unicode = unicode_writer(wf)
+            wf_unicode.write(WARNFILE_HEADER)
+            for (n, p, status) in miss_toc:
+                importers = self.graph.get_importers(n)
+                print(status, 'module named', n, '- imported by',
+                      ', '.join(dependency_description(name, data)
+                                for name, data in importers),
+                      file=wf_unicode)
+        logger.info("Warnings written to %s", CONF['warnfile'])
 
     def _write_graph_debug(self):
-        # With `--log-level DEBUG` write a xref and a dot-drawing of
-        # the graph.
+        """Write a xref (in html) and with `--log-level DEBUG` a dot-drawing
+        of the graph.
+        """
+        from ..config import CONF
+        with open_file(CONF['xref-file'], 'w', encoding='utf-8') as fh:
+            self.graph.create_xref(unicode_writer(fh))
+            logger.info("Graph cross-reference written to %s", CONF['xref-file'])
         if logger.getEffectiveLevel() > logging.DEBUG:
             return
-        from ..config import CONF
-        with open(CONF['dot-file'], 'w') as fh:
-            self.graph.graphreport(fh)
+        # The `DOT language's <https://www.graphviz.org/doc/info/lang.html>`_
+        # default character encoding (see the end of the linked page) is UTF-8.
+        with open_file(CONF['dot-file'], 'w', encoding='utf-8') as fh:
+            self.graph.graphreport(unicode_writer(fh))
             logger.info("Graph drawing written to %s", CONF['dot-file'])
-        with open(CONF['xref-file'], 'w') as fh:
-            self.graph.create_xref(fh)
-            logger.info("Graph cross-reference written to %s", CONF['xref-file'])
 
 
     def _check_python_library(self, binaries):
@@ -575,7 +662,7 @@ class Analysis(Target):
                 return
 
         # Python lib not in dependencies - try to find it.
-        logger.info('Python library not in binary depedencies. Doing additional searching...')
+        logger.info('Python library not in binary dependencies. Doing additional searching...')
         python_lib = bindepend.get_python_library_path()
         if python_lib:
             logger.debug('Adding Python library to binary dependencies')
@@ -635,7 +722,7 @@ def build(spec, distpath, workpath, clean_build):
     else:
         workpath = os.path.join(workpath, CONF['specnm'])
 
-    CONF['warnfile'] = os.path.join(workpath, 'warn%s.txt' % CONF['specnm'])
+    CONF['warnfile'] = os.path.join(workpath, 'warn-%s.txt' % CONF['specnm'])
     CONF['dot-file'] = os.path.join(workpath, 'graph-%s.dot' % CONF['specnm'])
     CONF['xref-file'] = os.path.join(workpath, 'xref-%s.html' % CONF['specnm'])
 
@@ -696,11 +783,12 @@ def build(spec, distpath, workpath, clean_build):
     from ..config import CONF
     CONF['workpath'] = workpath
 
-    # Executing the specfile.
-    with open(spec, 'r') as f:
-        text = f.read()
-    exec(text, spec_namespace)
-
+    # Execute the specfile. Read it as a binary file...
+    with open(spec, 'rU' if is_py2 else 'rb') as f:
+        # ... then let Python determine the encoding, since ``compile`` accepts
+        # byte strings.
+        code = compile(f.read(), spec, 'exec')
+    exec(code, spec_namespace)
 
 def __add_options(parser):
     parser.add_argument("--distpath", metavar="DIR",

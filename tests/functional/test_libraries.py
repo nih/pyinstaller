@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 #-----------------------------------------------------------------------------
-# Copyright (c) 2005-2016, PyInstaller Development Team.
+# Copyright (c) 2005-2019, PyInstaller Development Team.
 #
 # Distributed under the terms of the GNU General Public License with exception
 # for distributing bootloader.
@@ -10,17 +10,21 @@
 
 # Library imports
 # ---------------
+import py
 import pytest
 import os
 
 # Local imports
 # -------------
-from PyInstaller.compat import is_win, is_py3
-from PyInstaller.utils.tests import importorskip, xfail
+from PyInstaller.compat import is_win, is_py3, is_py35, is_py36, is_py37, \
+    is_darwin, is_linux, is_64bits
+from PyInstaller.utils.hooks import get_module_attribute, is_module_satisfies
+from PyInstaller.utils.tests import importorskip, xfail, skipif
 
 # :todo: find a way to get this from `conftest` or such
 # Directory with testing modules used in some tests.
-_MODULES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'modules')
+_MODULES_DIR = py.path.local(os.path.abspath(__file__)).dirpath('modules')
+_DATA_DIR = py.path.local(os.path.abspath(__file__)).dirpath('data')
 
 @importorskip('boto')
 @pytest.mark.skipif(is_py3, reason='boto does not fully support Python 3')
@@ -28,6 +32,7 @@ def test_boto(pyi_builder):
     pyi_builder.test_script('pyi_lib_boto.py')
 
 
+@xfail(reason='Issue #1844.')
 @importorskip('boto3')
 def test_boto3(pyi_builder):
     pyi_builder.test_source(
@@ -45,6 +50,7 @@ def test_boto3(pyi_builder):
         """)
 
 
+@xfail(reason='Issue #1844.')
 @importorskip('botocore')
 def test_botocore(pyi_builder):
     pyi_builder.test_source(
@@ -58,9 +64,25 @@ def test_botocore(pyi_builder):
         """)
 
 
+@xfail(is_darwin, reason='Issue #1895.')
 @importorskip('enchant')
 def test_enchant(pyi_builder):
     pyi_builder.test_script('pyi_lib_enchant.py')
+
+
+@skipif(is_py3, reason="Only tests Python 2.7 feature")
+def test_future(pyi_builder):
+    pyi_builder.test_script('pyi_future.py')
+
+
+@skipif(is_py3, reason="Only tests Python 2.7 feature")
+def test_future_queue(pyi_builder):
+    pyi_builder.test_source(
+        """
+        import queue
+        queue.Queue()
+        """
+    )
 
 
 @importorskip('gevent')
@@ -81,13 +103,17 @@ def test_gevent_monkey(pyi_builder):
         """)
 
 
+@xfail(is_darwin, reason='Issue #1895.')
 def test_tkinter(pyi_builder):
     pyi_builder.test_script('pyi_lib_tkinter.py')
 
+
+@xfail(is_darwin, reason='Issue #1895.')
 @importorskip('FixTk')
 def test_tkinter_FixTk(pyi_builder):
     # check if Tkinter includes FixTk
-    # TODO: FixTk doesn't exist in Python 3.4. Check when it was removed.
+    # TODO: Python 3 contains module 'tkinter._fix' - does it need any special test or handling?
+    # TODO: How does the following code check if FixTk is included?
     pyi_builder.test_source("""
     try:
         # In Python 2 the module name is 'Tkinter'
@@ -108,80 +134,35 @@ def test_zmq(pyi_builder):
         """)
 
 def test_pkg_resource_res_string(pyi_builder, monkeypatch):
-
-    from PyInstaller.building.build_main import Analysis
-    class MyAnalysis(Analysis):
-        def __init__(self, *args, **kwargs):
-            kwargs['datas'] = datas
-            # Setting back is required to make `super()` within
-            # Analysis access the correct class. Do not use
-            # `monkeypatch.undo()` as this will undo *all*
-            # monkeypathes.
-            monkeypatch.setattr('PyInstaller.building.build_main.Analysis',
-                                Analysis)
-            super(MyAnalysis, self).__init__(*args, **kwargs)
-
-    monkeypatch.setattr('PyInstaller.building.build_main.Analysis', MyAnalysis)
-
     # Include some data files for testing pkg_resources module.
-    # :fixme: When PyInstaller supports setting datas via the
-    # command-line, us this here instead of monkeypatching Analysis.
-    datas = [(os.path.join(_MODULES_DIR, 'pkg3', 'sample-data.txt'), 'pkg3')]
-    pyi_builder.test_script('pkg_resource_res_string.py')
+    datas = os.pathsep.join((str(_MODULES_DIR.join('pkg3', 'sample-data.txt')),
+                             'pkg3'))
+    pyi_builder.test_script('pkg_resource_res_string.py',
+                            pyi_args=['--add-data', datas])
 
 
 def test_pkgutil_get_data(pyi_builder, monkeypatch):
-
-    from PyInstaller.building.build_main import Analysis
-    class MyAnalysis(Analysis):
-        def __init__(self, *args, **kwargs):
-            kwargs['datas'] = datas
-            # Setting back is required to make `super()` within
-            # Analysis access the correct class. Do not use
-            # `monkeypatch.undo()` as this will undo *all*
-            # monkeypathes.
-            monkeypatch.setattr('PyInstaller.building.build_main.Analysis',
-                                Analysis)
-            super(MyAnalysis, self).__init__(*args, **kwargs)
-
-    monkeypatch.setattr('PyInstaller.building.build_main.Analysis', MyAnalysis)
-
     # Include some data files for testing pkg_resources module.
-    # :fixme: When PyInstaller supports setting datas via the
-    # command-line, us this here instead of monkeypatching Analysis.
-    datas = [(os.path.join(_MODULES_DIR, 'pkg3', 'sample-data.txt'), 'pkg3')]
-    pyi_builder.test_script('pkgutil_get_data.py')
+    datas = os.pathsep.join((str(_MODULES_DIR.join('pkg3', 'sample-data.txt')),
+                             'pkg3'))
+    pyi_builder.test_script('pkgutil_get_data.py',
+                            pyi_args=['--add-data', datas])
 
 
 @xfail(reason='Our import mechanism returns the wrong loader-class for __main__.')
 def test_pkgutil_get_data__main__(pyi_builder, monkeypatch):
-
-    from PyInstaller.building.build_main import Analysis
-    class MyAnalysis(Analysis):
-        def __init__(self, *args, **kwargs):
-            kwargs['datas'] = datas
-            # Setting back is required to make `super()` within
-            # Analysis access the correct class. Do not use
-            # `monkeypatch.undo()` as this will undo *all*
-            # monkeypathes.
-            monkeypatch.setattr('PyInstaller.building.build_main.Analysis',
-                                Analysis)
-            super(MyAnalysis, self).__init__(*args, **kwargs)
-
-    monkeypatch.setattr('PyInstaller.building.build_main.Analysis', MyAnalysis)
-
     # Include some data files for testing pkg_resources module.
-    # :fixme: When PyInstaller supports setting datas via the
-    # command-line, us this here instead of monkeypatching Analysis.
-    datas = [(os.path.join(_MODULES_DIR, 'pkg3', 'sample-data.txt'), 'pkg3')]
-    pyi_builder.test_script('pkgutil_get_data__main__.py')
-
+    datas = os.pathsep.join((str(_MODULES_DIR.join('pkg3', 'sample-data.txt')),
+                             'pkg3'))
+    pyi_builder.test_script('pkgutil_get_data__main__.py',
+                            pyi_args=['--add-data', datas])
 
 
 @importorskip('sphinx')
 def test_sphinx(tmpdir, pyi_builder, data_dir):
     # Note that including the data_dir fixture copies files needed by this test.
     pyi_builder.test_script('pyi_lib_sphinx.py')
+
 
 @importorskip('pylint')
 def test_pylint(pyi_builder):
@@ -213,6 +194,7 @@ def test_pygments(pyi_builder):
         print(highlight(code, PythonLexer(), HtmlFormatter()))
         """)
 
+
 @importorskip('markdown')
 def test_markdown(pyi_builder):
     # Markdown uses __import__ed extensions. Make sure these work by
@@ -220,8 +202,10 @@ def test_markdown(pyi_builder):
     pyi_builder.test_source(
         """
         import markdown
-        print(markdown.markdown('testing',  ['toc']))
+        print(markdown.markdown('testing',
+            extensions=['markdown.extensions.toc']))
         """)
+
 
 @importorskip('PyQt4')
 def test_PyQt4_QtWebKit(pyi_builder):
@@ -246,19 +230,206 @@ def test_PyQt4_uic(tmpdir, pyi_builder, data_dir):
     # Note that including the data_dir fixture copies files needed by this test.
     pyi_builder.test_script('pyi_lib_PyQt4-uic.py')
 
+
+@pytest.mark.skipif(is_module_satisfies('Qt >= 5.6', get_module_attribute('PyQt5.QtCore', 'QT_VERSION_STR')),
+                    reason='QtWebKit is depreciated in Qt 5.6+')
 @importorskip('PyQt5')
 def test_PyQt5_QtWebKit(pyi_builder):
     pyi_builder.test_script('pyi_lib_PyQt5-QtWebKit.py')
 
+
+PYQT5_NEED_OPENGL = pytest.mark.skipif(is_module_satisfies('PyQt5 <= 5.10.1'),
+    reason='PyQt5 v5.10.1 and older does not package ``opengl32sw.dll``, the '
+    'OpenGL software renderer, which this test requires.')
+
+
+@PYQT5_NEED_OPENGL
 @importorskip('PyQt5')
 def test_PyQt5_uic(tmpdir, pyi_builder, data_dir):
     # Note that including the data_dir fixture copies files needed by this test.
     pyi_builder.test_script('pyi_lib_PyQt5-uic.py')
 
 
+@pytest.mark.skipif(is_win and not is_64bits, reason="Qt 5.11+ for Windows "
+    "only provides pre-compiled Qt WebEngine binaries for 64-bit processors.")
+@pytest.mark.skipif(is_module_satisfies('PyQt5 == 5.11.3') and is_darwin,
+    reason='This version of the OS X wheel does not include QWebEngine.')
+@importorskip('PyQt5')
+def test_PyQt5_QWebEngine(pyi_builder, data_dir):
+    # Produce the source code to test by inserting the path to the HTML page to
+    # display.
+    source_to_test = """
+        from PyQt5.QtWidgets import QApplication
+        from PyQt5.QtWebEngineWidgets import QWebEngineView
+        from PyQt5.QtCore import QUrl, QTimer
+
+        app = QApplication([])
+        view = QWebEngineView()
+        # Use a raw string to avoid accidental special characters in Windows filenames:
+        # ``c:\temp`` is `c<tab>emp`!
+        view.load(QUrl.fromLocalFile(r'{}'))
+        view.show()
+        view.page().loadFinished.connect(
+            # Display the web page for one second after it loads.
+            lambda ok: QTimer.singleShot(1000, app.quit))
+        app.exec_()
+        """.format(data_dir.join('test_web_page.html').strpath)
+
+    if is_darwin:
+        # This tests running the QWebEngine on OS X. To do so, the test must:
+        #
+        # 1. Run only a onedir build -- onefile builds don't work.
+        if pyi_builder._mode != 'onedir':
+            pytest.skip('The QWebEngine .app bundle ' +
+                        'only supports onedir mode.')
+
+        # 2. Only test the Mac .app bundle, by modifying the executes this
+        #    fixture runs.
+        _old_find_executables = pyi_builder._find_executables
+        # Create a replacement method that selects just the .app bundle.
+
+        def _replacement_find_executables(self, name):
+            path_to_onedir, path_to_app_bundle = _old_find_executables(name)
+            return [path_to_app_bundle]
+        # Use this in the fixture. See https://stackoverflow.com/a/28060251 and
+        # https://docs.python.org/3/howto/descriptor.html.
+        pyi_builder._find_executables = \
+            _replacement_find_executables.__get__(pyi_builder)
+
+        # 3. Run the test with specific command-line arguments.
+        pyi_builder.test_source(source_to_test,
+                                pyi_args=['--windowed'])
+    else:
+        # The Linux and Windows QWebEngine test needs no special handling.
+        pyi_builder.test_source(source_to_test)
+
+
+@PYQT5_NEED_OPENGL
+@importorskip('PyQt5')
+def test_PyQt5_QtQml(pyi_builder):
+    pyi_builder.test_source(
+        """
+        import sys
+
+        from PyQt5.QtGui import QGuiApplication
+        from PyQt5.QtQml import QQmlApplicationEngine
+        from PyQt5.QtCore import QTimer, QUrl
+
+        # Select a style via the `command line <https://doc.qt.io/qt-5/qtquickcontrols2-styles.html#command-line-argument>`_,
+        # since currently PyQt5 doesn't `support https://riverbankcomputing.com/pipermail/pyqt/2018-March/040180.html>`_
+        # ``QQuickStyle``. Using this style with the QML below helps to verify
+        # that all QML files are packaged; see https://github.com/pyinstaller/pyinstaller/issues/3711.
+        app = QGuiApplication(sys.argv + ['-style', 'imagine'])
+        engine = QQmlApplicationEngine()
+        engine.loadData(b'''
+            import QtQuick 2.11
+            import QtQuick.Controls 2.4
+
+            ApplicationWindow {
+                visible: true
+                ProgressBar {value: 0.6}
+            }
+            ''', QUrl())
+
+        if not engine.rootObjects():
+            sys.exit(-1)
+
+        # Exit Qt when the main loop becomes idle.
+        QTimer.singleShot(0, app.exit)
+
+        res = app.exec_()
+        del engine
+        sys.exit(res)
+        """)
+
+
+@importorskip('PyQt5')
+def test_PyQt5_SSL_support(pyi_builder):
+    pyi_builder.test_source(
+        """
+        from PyQt5.QtNetwork import QSslSocket
+        assert QSslSocket.supportsSsl()
+        """)
+
+
+# Test that the ``PyQt5.Qt`` module works by importing something from it.
+#
+# The Qt Bluetooth API (which any import to ``PyQt5.Qt`` implicitly imports)
+# isn't compatible with Windows Server 2012 R2, the OS Appveyor runs.
+# Specifically, running on Server 2012 causes the test to display an error in
+# `a dialog box <https://github.com/mindfulness-at-the-computer/mindfulness-at-the-computer/issues/234>`_.
+# The alternative of using a newer Appveyor OS `fails <https://github.com/pyinstaller/pyinstaller/pull/3563>`_.
+# Therefore, skip this test on Appveyor by testing for one of its `environment
+# variables <https://www.appveyor.com/docs/environment-variables/>`_.
+@skipif(os.environ.get('APPVEYOR') == 'True',
+        reason='The Appveyor OS is incompatible with PyQt.Qt.')
+@importorskip('PyQt5')
+@pytest.mark.skipif(is_module_satisfies('PyQt5 == 5.11.3') and is_darwin,
+    reason='This version of the OS X wheel does not include QWebEngine.')
+def test_PyQt5_Qt(pyi_builder):
+    pyi_builder.test_source('from PyQt5.Qt import QLibraryInfo')
+
+
+@xfail(is_linux and is_py35, reason="Fails on linux >3.5")
+@xfail(is_darwin, reason="Fails on OSX")
+@xfail(is_win and is_py35 and not is_py36, reason="Fails on win == 3.6")
+@importorskip('PySide2')
+def test_PySide2_QWebEngine(pyi_builder):
+    pyi_builder.test_source(
+        """
+        from PySide2.QtWidgets import QApplication
+        from PySide2.QtWebEngineWidgets import QWebEngineView
+        from PySide2.QtCore import QUrl
+        app = QApplication( [] )
+        view = QWebEngineView()
+        view.load( QUrl( "http://www.pyinstaller.org" ) )
+        view.show()
+        view.page().loadFinished.connect(lambda ok: app.quit())
+        app.exec_()
+        """)
+
+
+@importorskip('PySide2')
+def test_PySide2_QtQuick(pyi_builder):
+    pyi_builder.test_source(
+        """
+        import sys
+
+        # Not used. Only here to trigger the hook
+        import PySide2.QtQuick
+
+        from PySide2.QtGui import QGuiApplication
+        from PySide2.QtQml import QQmlApplicationEngine
+        from PySide2.QtCore import QTimer, QUrl
+
+        app = QGuiApplication([])
+        engine = QQmlApplicationEngine()
+        engine.loadData(b'''
+            import QtQuick 2.0
+            import QtQuick.Controls 2.0
+
+            ApplicationWindow {
+                visible: true
+                color: "green"
+            }
+            ''', QUrl())
+
+        if not engine.rootObjects():
+            sys.exit(-1)
+
+        # Exit Qt when the main loop becomes idle.
+        QTimer.singleShot(0, app.exit)
+
+        sys.exit(app.exec_())
+        """)
+
+
 @importorskip('zope.interface')
 def test_zope_interface(pyi_builder):
-    # Tests that modules without __init__.py file are bundled properly.
+    # Tests that `nspkg.pth`-based namespace package are bundled properly.
+    # The `nspkg.pth` file is created by setuptools and thus changes
+    # frequently. If this test fails most propably
+    # _SETUPTOOLS_NAMESPACEPKG_PTHs in modulegraph needs to be updated.
     pyi_builder.test_source(
         """
         # Package 'zope' does not contain __init__.py file.
@@ -272,7 +443,10 @@ def test_idlelib(pyi_builder):
     pyi_builder.test_source(
         """
         # This file depends on loading some icons, located based on __file__.
-        import idlelib.TreeWidget
+        try:
+            import idlelib.TreeWidget
+        except:
+            import idlelib.tree
         """)
 
 
@@ -299,6 +473,15 @@ def test_numpy(pyi_builder):
         import numpy
         from numpy.core.numeric import dot
         print('dot(3, 4):', dot(3, 4))
+        """)
+
+
+@importorskip('openpyxl')
+def test_openpyxl(pyi_builder):
+    pyi_builder.test_source(
+        """
+        # Test the hook to openpyxl
+        from openpyxl import __version__
         """)
 
 
@@ -353,7 +536,38 @@ def test_pycrypto(pyi_builder):
         print('AES null encryption, block size', BLOCK_SIZE)
         # Just for testing functionality after all
         print('HEX', binascii.hexlify(
-            AES.new("\\0" * BLOCK_SIZE).encrypt("\\0" * BLOCK_SIZE)))
+            AES.new(b"\\0" * BLOCK_SIZE, AES.MODE_ECB).encrypt(b"\\0" * BLOCK_SIZE)))
+        """)
+
+
+@importorskip('Cryptodome')
+def test_cryptodome(pyi_builder):
+    pyi_builder.test_source(
+        """
+        from Cryptodome import Cipher
+        print('Cryptodome Cipher Module:', Cipher)
+        """)
+
+
+@skipif(is_win and is_py37, reason='The call to ssl.wrap_socket produces '
+        '"ssl.SSLError: [SSL: EE_KEY_TOO_SMALL] ee key too small '
+        '(_ssl.c:3717)" on Windows Python 3.7.')
+@importorskip('requests')
+def test_requests(tmpdir, pyi_builder, data_dir, monkeypatch):
+    # Note that including the data_dir fixture copies files needed by this test.
+    # Include the data files.
+    datas = os.pathsep.join((str(data_dir.join('*')), os.curdir))
+    pyi_builder.test_script('pyi_lib_requests.py',
+                            pyi_args=['--add-data', datas])
+
+
+@importorskip('urllib3.packages.six')
+def test_urllib3_six(pyi_builder):
+    # Test for pre-safe-import urllib3.packages.six.moves.
+    pyi_builder.test_source("""
+        import urllib3.connectionpool
+        import types
+        assert isinstance(urllib3.connectionpool.queue, types.ModuleType)
         """)
 
 
@@ -436,22 +650,6 @@ def test_scapy3(pyi_builder):
         """)
 
 
-@importorskip('scipy')
-def test_scipy(pyi_builder):
-    pyi_builder.test_source(
-        """
-        # General SciPy import.
-        from scipy import *
-        # Test import hooks for the following modules.
-        import scipy.io.matlab
-        import scipy.sparse.csgraph
-        # Some other "problematic" scipy submodules.
-        import scipy.lib
-        import scipy.linalg
-        import scipy.signal
-        """)
-
-
 @importorskip('sqlalchemy')
 def test_sqlalchemy(pyi_builder):
     pyi_builder.test_source(
@@ -465,7 +663,6 @@ def test_sqlalchemy(pyi_builder):
 
 
 @importorskip('twisted')
-@pytest.mark.skipif(is_win, reason='Python 3 syntax error on Windows')
 def test_twisted(pyi_builder):
     pyi_builder.test_source(
         """
@@ -485,46 +682,8 @@ def test_twisted(pyi_builder):
             raise SystemExit('Twisted reactor not properly initialized.')
         """)
 
-# matplotlib tries to import any of PyQt4, PyQt5 or PySide. But if we
-# have more then one of these in the frozen app, the app's
-# runtime-hooks will crash. Thus we need to exclude the other two.
-all_qt_pkgs = ['PyQt4', 'PyQt5', 'PySide']
-excludes = []
-for pkg in all_qt_pkgs:
-    p = [p for p in all_qt_pkgs]
-    p = importorskip(pkg)(p)
-    excludes.append(p)
-
-@importorskip('matplotlib')
-@pytest.mark.parametrize("excludes", excludes, ids=all_qt_pkgs)
-def test_matplotlib(pyi_builder, excludes):
-    pyi_args = ['--exclude-module=%s' % e for e in excludes]
-    pyi_builder.test_source(
-        """
-        import os
-        import matplotlib
-        import sys
-        import tempfile
-        # In frozen state rthook should force matplotlib to create config directory
-        # in temp directory and not $HOME/.matplotlib.
-        configdir = os.environ['MPLCONFIGDIR']
-        print(('MPLCONFIGDIR: %s' % configdir))
-        if not configdir.startswith(tempfile.gettempdir()):
-            raise SystemExit('MPLCONFIGDIR not pointing to temp directory.')
-        # matplotlib data directory should point to sys._MEIPASS.
-        datadir = os.environ['MATPLOTLIBDATA']
-        print(('MATPLOTLIBDATA: %s' % datadir))
-        if not datadir.startswith(sys._MEIPASS):
-            raise SystemExit('MATPLOTLIBDATA not pointing to sys._MEIPASS.')
-        # This import was reported to fail with matplotlib 1.3.0.
-        from mpl_toolkits import axes_grid1
-        """, pyi_args=pyi_args)
-
-del all_qt_pkgs, excludes
-
 
 @importorskip('pyexcelerate')
-@pytest.mark.xfail(reason='TODO - known to fail')
 def test_pyexcelerate(pyi_builder):
     pyi_builder.test_source(
         """
@@ -535,89 +694,50 @@ def test_pyexcelerate(pyi_builder):
 
 
 @importorskip('usb')
+@pytest.mark.skipif(is_linux, reason='libusb_exit segfaults on some linuxes')
 def test_usb(pyi_builder):
     # See if the usb package is supported on this platform.
     try:
         import usb
         # This will verify that the backend is present; if not, it will
         # skip this test.
-        usb.core.find(find_all = True)
-    except (ImportError, ValueError):
+        usb.core.find()
+    except (ImportError, usb.core.NoBackendError):
         pytest.skip('USB backnd not found.')
 
     pyi_builder.test_source(
         """
         import usb.core
-        # Detect usb devices.
-        devices = usb.core.find(find_all = True)
-        if not devices:
-            raise SystemExit('No USB device found.')
+        # NoBackendError fails the test if no backends are found.
+        usb.core.find()
         """)
 
 
-@importorskip('gi.repository.Gio')
-def test_gi_gio_binding(pyi_builder):
+@importorskip('zeep')
+def test_zeep(pyi_builder):
     pyi_builder.test_source(
         """
-        import gi
-        gi.require_version('Gio', '2.0')
-        from gi.repository import Gio
-        print(Gio)
-        """)
-
-
-@importorskip('gi.repository.GLib')
-def test_gi_glib_binding(pyi_builder):
-    pyi_builder.test_source(
-        """
-        import gi
-        gi.require_version('GLib', '2.0')
-        from gi.repository import GLib
-        print(GLib)
-        """)
-
-
-@importorskip('gi.repository.GModule')
-def test_gi_gmodule_binding(pyi_builder):
-    pyi_builder.test_source(
-        """
-        import gi
-        gi.require_version('GModule', '2.0')
-        from gi.repository import GModule
-        print(GModule)
-        """)
-
-
-@importorskip('gi.repository.GObject')
-def test_gi_gobject_binding(pyi_builder):
-    pyi_builder.test_source(
-        """
-        import gi
-        gi.require_version('GObject', '2.0')
-        from gi.repository import GObject
-        print(GObject)
-        """)
-
-
-@importorskip('gi.repository.Gst')
-def test_gi_gst_binding(pyi_builder):
-    pyi_builder.test_source(
-        """
-        import gi
-        gi.require_version('Gst', '1.0')
-        from gi.repository import Gst
-        Gst.init(None)
-        print(Gst)
+        # Test the hook to zeep
+        from zeep import utils
+        utils.get_version()
         """)
 
 
 @importorskip('PIL')
-@pytest.mark.xfail(reason="Fails with Pillow 3.0.0")
-def test_pil_img_conversion(pyi_builder_spec):
-    pyi_builder_spec.test_spec('pyi_lib_PIL_img_conversion.spec')
+#@pytest.mark.xfail(reason="Fails with Pillow 3.0.0")
+def test_pil_img_conversion(pyi_builder):
+    datas = os.pathsep.join((str(_DATA_DIR.join('PIL_images')), '.'))
+    pyi_builder.test_script(
+        'pyi_lib_PIL_img_conversion.py',
+        pyi_args=['--add-data', datas,
+                  # Use console mode or else on Windows the VS() messageboxes
+                  # will stall pytest.
+                  '--console'])
 
 
-@importorskip('PIL', 'FixTk')
+@xfail(is_darwin, reason='Issue #1895.')
+@importorskip('PIL')
+@importorskip('FixTk')
 def test_pil_FixTk(pyi_builder):
     # hook-PIL is excluding FixTk, but is must still be included
     # since it is imported elsewhere. Also see issue #1584.
@@ -630,7 +750,8 @@ def test_pil_FixTk(pyi_builder):
     import FixTk, PIL
     """)
 
-@importorskip('PIL.ImageQt', 'PyQt5')
+@importorskip('PIL.ImageQt')
+@importorskip('PyQt5')
 def test_pil_PyQt5(pyi_builder):
     # hook-PIL is excluding PyQt5, but is must still be included
     # since it is imported elsewhere. Also see issue #1584.
@@ -640,7 +761,8 @@ def test_pil_PyQt5(pyi_builder):
     import PIL.ImageQt
     """)
 
-@importorskip('PIL.ImageQt', 'PyQt4')
+@importorskip('PIL.ImageQt')
+@importorskip('PyQt4')
 def test_pil_PyQt4(pyi_builder):
     # hook-PIL is excluding PyQt4, but is must still be included
     # since it is imported elsewhere. Also see issue #1584.
@@ -676,9 +798,66 @@ def test_pil_plugins(pyi_builder):
 
 @importorskip('pandas')
 def test_pandas_extension(pyi_builder):
-    # Tests that C extension 'pandas.lib' is properly bundled. Issue #1580.
+    # Tests that the C extension ``pandas._libs.lib`` is properly bundled. Issue #1580.
+    # See http://pandas.pydata.org/pandas-docs/stable/whatsnew.html#modules-privacy-has-changed.
     pyi_builder.test_source(
         """
-        from pandas.lib import is_float
+        from pandas._libs.lib import is_float
         assert is_float(1) == 0
+        """)
+
+@importorskip('h5py')
+def test_h5py(pyi_builder):
+    pyi_builder.test_source("""
+        import h5py
+        """)
+
+
+@importorskip('unidecode')
+def test_unidecode(pyi_builder):
+    pyi_builder.test_source("""
+        from unidecode import unidecode
+
+        # Unidecode should not skip non-ASCII chars if mappings for them exist.
+        assert unidecode(u"kožušček") == "kozuscek"
+        """)
+
+
+@importorskip('pinyin')
+def test_pinyin(pyi_builder):
+    pyi_builder.test_source("""
+        import pinyin
+        """)
+
+
+@importorskip('uvloop')
+@skipif(is_win or not is_py35, reason='Windows, or py < 3.5 not supported')
+def test_uvloop(pyi_builder):
+    pyi_builder.test_source("import uvloop")
+
+
+@importorskip('web3')
+def test_web3(pyi_builder):
+    pyi_builder.test_source("import web3")
+
+
+@importorskip('phonenumbers')
+def test_phonenumbers(pyi_builder):
+    pyi_builder.test_source("""
+        import phonenumbers
+
+        number = '+17034820623'
+        parsed_number = phonenumbers.parse(number)
+
+        assert(parsed_number.country_code == 1)
+        assert(parsed_number.national_number == 7034820623)
+        """)
+
+
+@importorskip('pendulum')
+def test_pendulum(pyi_builder):
+    pyi_builder.test_source("""
+        import pendulum
+
+        print(pendulum.now().isoformat())
         """)

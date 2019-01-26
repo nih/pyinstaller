@@ -1,5 +1,5 @@
 #-----------------------------------------------------------------------------
-# Copyright (c) 2014-2016, PyInstaller Development Team.
+# Copyright (c) 2014-2019, PyInstaller Development Team.
 #
 # Distributed under the terms of the GNU General Public License with exception
 # for distributing bootloader.
@@ -13,10 +13,9 @@ Utils for Mac OS X platform.
 """
 
 import os
-import sys
 
 from ..compat import base_prefix, exec_command
-from ..lib.macholib.MachO import MachO
+from macholib.MachO import MachO
 
 
 def is_homebrew_env():
@@ -102,6 +101,5 @@ def fix_exe_for_code_signing(filename):
     linkedit.filesize = new_segsize
     linkedit.vmsize = new_segsize
     ## Write changes back.
-    fp = open(exe_data.filename, 'rb+')
-    exe_data.write(fp)
-    fp.close()
+    with open(exe_data.filename, 'rb+') as fp:
+        exe_data.write(fp)

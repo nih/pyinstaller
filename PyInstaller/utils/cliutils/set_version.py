@@ -1,5 +1,5 @@
 #-----------------------------------------------------------------------------
-# Copyright (c) 2013-2016, PyInstaller Development Team.
+# Copyright (c) 2013-2019, PyInstaller Development Team.
 #
 # Distributed under the terms of the GNU General Public License with exception
 # for distributing bootloader.
@@ -11,12 +11,7 @@
 import os
 import argparse
 
-import PyInstaller.utils.win32.versioninfo
-import PyInstaller.log
-
 def run():
-    PyInstaller.log.init()
-
     parser = argparse.ArgumentParser()
     parser.add_argument('info_file', metavar='info-file',
                         help="text file containing version info")
@@ -28,6 +23,7 @@ def run():
     exe_file = os.path.abspath(args.exe_file)
 
     try:
+        import PyInstaller.utils.win32.versioninfo
         vs = PyInstaller.utils.win32.versioninfo.SetVersion(exe_file, info_file)
         print(('Version info set in: %s' % exe_file))
     except KeyboardInterrupt:

@@ -1,6 +1,6 @@
 /*
  * ****************************************************************************
- * Copyright (c) 2013-2016, PyInstaller Development Team.
+ * Copyright (c) 2013-2019, PyInstaller Development Team.
  * Distributed under the terms of the GNU General Public License with exception
  * for distributing bootloader.
  *
@@ -8,28 +8,25 @@
  * ****************************************************************************
  */
 
-
 /*
  * Bootloader for a packed executable.
  */
 
-
-// TODO: use safe string functions
+/* TODO: use safe string functions */
 #define _CRT_SECURE_NO_WARNINGS 1
-
 
 #ifdef _WIN32
     #include <windows.h>
     #include <wchar.h>
 #else
-    #include <limits.h>  // PATH_MAX
+    #include <limits.h>  /* PATH_MAX */
 #endif
-#include <stdio.h>  // FILE
-#include <stdlib.h>  // calloc
-#include <string.h>  // memset
+#include <stdio.h>  /* FILE */
+#include <stdlib.h> /* calloc */
+#include <string.h> /* memset */
 
 /* PyInstaller headers. */
-#include "pyi_global.h" // PATH_MAX for win32
+#include "pyi_global.h"  /* PATH_MAX for win32 */
 #include "pyi_path.h"
 #include "pyi_archive.h"
 #include "pyi_utils.h"
@@ -37,8 +34,8 @@
 #include "pyi_launch.h"
 #include "pyi_win32_utils.h"
 
-
-int pyi_main(int argc, char * argv[])
+int
+pyi_main(int argc, char * argv[])
 {
     /*  archive_status contain status information of the main process. */
     ARCHIVE_STATUS *archive_status = NULL;
@@ -54,14 +51,15 @@ int pyi_main(int argc, char * argv[])
 #ifdef _MSC_VER
     /* Visual C runtime incorrectly buffers stderr */
     setbuf(stderr, (char *)NULL);
-#endif /* _MSC_VER */
+#endif  /* _MSC_VER */
 
     VS("PyInstaller Bootloader 3.x\n");
 
-    // TODO create special function to allocate memory for archive status pyi_arch_status_alloc_memory(archive_status);
-    archive_status = (ARCHIVE_STATUS *) calloc(1,sizeof(ARCHIVE_STATUS));
+    /* TODO create special function to allocate memory for archive status pyi_arch_status_alloc_memory(archive_status); */
+    archive_status = (ARCHIVE_STATUS *) calloc(1, sizeof(ARCHIVE_STATUS));
+
     if (archive_status == NULL) {
-        FATALERROR("Cannot allocate memory for ARCHIVE_STATUS\n");
+        FATAL_PERROR("calloc", "Cannot allocate memory for ARCHIVE_STATUS\n");
         return -1;
 
     }
@@ -95,7 +93,7 @@ int pyi_main(int argc, char * argv[])
     if (pyi_arch_setup(archive_status, homepath, &executable[strlen(homepath)])) {
         if (pyi_arch_setup(archive_status, homepath, &archivefile[strlen(homepath)])) {
             FATALERROR("Cannot open self %s or archive %s\n",
-                    executable, archivefile);
+                       executable, archivefile);
             return -1;
         }
     }
@@ -104,28 +102,39 @@ int pyi_main(int argc, char * argv[])
     archive_status->argc = argc;
     archive_status->argv = argv;
 
+#if defined(_WIN32) || defined(__APPLE__)
 
-#ifdef _WIN32
-    /* On Windows use single-process for --onedir mode. */
+    /* On Windows and Mac use single-process for --onedir mode. */
     if (!extractionpath && !pyi_launch_need_to_extract_binaries(archive_status)) {
         VS("LOADER: No need to extract files to run; setting extractionpath to homepath\n");
         extractionpath = homepath;
     }
-    if(extractionpath) {
+
+#endif
+
+#ifdef _WIN32
+
+    if (extractionpath) {
         /* Add extraction folder to DLL search path */
         dllpath_w = pyi_win32_utils_from_utf8(NULL, extractionpath, 0);
         SetDllDirectory(dllpath_w);
         VS("LOADER: SetDllDirectory(%s)\n", extractionpath);
         free(dllpath_w);
     }
-#endif
+#endif /* ifdef _WIN32 */
+
     if (extractionpath) {
         VS("LOADER: Already in the child - running user's code.\n");
+
         /*  If binaries were extracted to temppath,
          *  we pass it through status variable
          */
         if (strcmp(homepath, extractionpath) != 0) {
-            strcpy(archive_status->temppath, extractionpath);
+            strncpy(archive_status->temppath, extractionpath, PATH_MAX);
+            if (archive_status->temppath[PATH_MAX-1] != '\0') {
+                VS("LOADER: temppath exceeds PATH_MAX\n");
+                return -1;
+            }
             /*
              * Temp path exits - set appropriate flag and change
              * status->mainpath to point to temppath.
@@ -139,7 +148,8 @@ int pyi_main(int argc, char * argv[])
         rc = pyi_launch_execute(archive_status);
         pyi_launch_finalize(archive_status);
 
-    } else {
+    }
+    else {
 
         /* status->temppath is created if necessary. */
         if (pyi_launch_extract_binaries(archive_status)) {
@@ -151,27 +161,31 @@ int pyi_main(int argc, char * argv[])
         /* Run the 'child' process, then clean up. */
 
         VS("LOADER: Executing self as child\n");
-        pyi_setenv("_MEIPASS2", archive_status->temppath[0] != 0 ? archive_status->temppath : homepath);
+        pyi_setenv("_MEIPASS2",
+                   archive_status->temppath[0] !=
+                   0 ? archive_status->temppath : homepath);
 
         VS("LOADER: set _MEIPASS2 to %s\n", pyi_getenv("_MEIPASS2"));
 
-        if (pyi_utils_set_environment(archive_status) == -1)
+        if (pyi_utils_set_environment(archive_status) == -1) {
             return -1;
+        }
 
-	/* Transform parent to background process on OSX only. */
-	pyi_parent_to_background();
+        /* Transform parent to background process on OSX only. */
+        pyi_parent_to_background();
 
         /* Run user's code in a subprocess and pass command line arguments to it. */
-        rc = pyi_utils_create_child(executable, argc, argv);
+        rc = pyi_utils_create_child(executable, archive_status, argc, argv);
 
         VS("LOADER: Back to parent (RC: %d)\n", rc);
 
         VS("LOADER: Doing cleanup\n");
-        if (archive_status->has_temp_directory == true)
+
+        if (archive_status->has_temp_directory == true) {
             pyi_remove_temp_path(archive_status->temppath);
+        }
         pyi_arch_status_free_memory(archive_status);
-        if (extractionpath != NULL)
-            free(extractionpath);
+
     }
     return rc;
 }

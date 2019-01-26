@@ -1,5 +1,5 @@
 #-----------------------------------------------------------------------------
-# Copyright (c) 2005-2016, PyInstaller Development Team.
+# Copyright (c) 2005-2019, PyInstaller Development Team.
 #
 # Distributed under the terms of the GNU General Public License with exception
 # for distributing bootloader.
@@ -19,7 +19,8 @@ instance, thus modifying which modules will be frozen into the executable.
 """
 
 from .datastruct import TOC
-from ..lib.modulegraph.modulegraph import RuntimeModule
+from ..lib.modulegraph.modulegraph import RuntimeModule, RuntimePackage
+from .utils import format_binaries_and_datas
 
 
 class PreSafeImportModuleAPI(object):
@@ -85,11 +86,15 @@ class PreSafeImportModuleAPI(object):
         "Current module graph"
         return self._module_graph
 
+    #FIXME: Remove this property and publicize the "_module_name" attribute to
+    #"module_name". This attribute is intended to be modifiable by hooks.
     @property
     def module_name(self):
         "Fully-qualified name of this module (e.g., `email.mime.text`)."
         return self._module_name
 
+    #FIXME: Remove this property and publicize the "_module_basename" attribute
+    #to "module_basename". This attribute is intended to be modifiable by hooks.
     @property
     def module_basename(self):
         "Unqualified name of the module to be imported (e.g., `text`)."
@@ -101,23 +106,69 @@ class PreSafeImportModuleAPI(object):
         return self._parent_package
 
 
-    def add_runtime_module(self, fully_qualified_name):
+    def add_runtime_module(self, module_name):
         """
-        Add a node representing a Python module dynamically defined at
-        runtime.
+        Add a graph node representing a non-package Python module with the
+        passed name dynamically defined at runtime.
 
-        Most modules are statically defined at creation time in
-        external Python files. Some modules, however, are dynamically
-        defined at runtime (e.g., `six.moves`, dynamically defined by
-        the statically defined `six` module). This method add a node
-        represents such a module.
+        Most modules are statically defined on-disk as standard Python files.
+        Some modules, however, are dynamically defined in-memory at runtime
+        (e.g., `gi.repository.Gst`, dynamically defined by the statically
+        defined `gi.repository.__init__` module).
 
-        It is typically used like this::
+        This method adds a graph node representing such a runtime module. Since
+        this module is _not_ a package, all attempts to import submodules from
+        this module in `from`-style import statements (e.g., the `queue`
+        submodule in `from six.moves import queue`) will be silently ignored. To
+        circumvent this, simply call `add_runtime_package()` instead.
 
-          api.add_runtime_module(api.module_name)
+        Parameters
+        ----------
+        module_name : str
+            Fully-qualified name of this module (e.g., `gi.repository.Gst`).
 
+        Examples
+        ----------
+        This method is typically called by `pre_safe_import_module()` hooks:
+        e.g.,
+
+            def pre_safe_import_module(api):
+                api.add_runtime_module(api.module_name)
         """
-        self._module_graph.add_module(RuntimeModule(fully_qualified_name))
+
+        self._module_graph.add_module(RuntimeModule(module_name))
+
+
+    def add_runtime_package(self, package_name):
+        """
+        Add a graph node representing a non-namespace Python package with the
+        passed name dynamically defined at runtime.
+
+        Most packages are statically defined on-disk as standard subdirectories
+        containing `__init__.py` files. Some packages, however, are dynamically
+        defined in-memory at runtime (e.g., `six.moves`, dynamically defined by
+        the statically defined `six` module).
+
+        This method adds a graph node representing such a runtime package. All
+        attributes imported from this package in `from`-style import statements
+        that are submodules of this package (e.g., the `queue` submodule in
+        `from six.moves import queue`) will be imported rather than ignored.
+
+        Parameters
+        ----------
+        package_name : str
+            Fully-qualified name of this package (e.g., `six.moves`).
+
+        Examples
+        ----------
+        This method is typically called by `pre_safe_import_module()` hooks:
+        e.g.,
+
+            def pre_safe_import_module(api):
+                api.add_runtime_package(api.module_name)
+        """
+
+        self._module_graph.add_module(RuntimePackage(package_name))
 
 
     def add_alias_module(self, real_module_name, alias_module_name):
@@ -138,18 +189,25 @@ class PreSafeImportModuleAPI(object):
             Fully-qualified name of the **non-existent module** (i.e.,
             the alias to be created).
         """
+
         self._module_graph.alias_module(real_module_name, alias_module_name)
 
 
     def append_package_path(self, directory):
         """
-        Modulegraph does a good job at simulating Python's, but it can not
-        handle packagepath __path__ modifications packages make at runtime.
+        Modulegraph does a good job at simulating Python's, but it cannot
+        handle packagepath `__path__` modifications packages make at runtime.
+
         Therefore there is a mechanism whereby you can register extra paths
         in this map for a package, and it will be honored.
 
-        :param directory: directory to append to the  __path__ attribute.
+        Parameters
+        ----------
+        directory : str
+            Absolute or relative path of the directory to be appended to this
+            package's `__path__` attribute.
         """
+
         self._module_graph.append_package_path(self._module_name, directory)
 
 
@@ -316,6 +374,10 @@ class PostGraphAPI(object):
         self.___path__ = tuple(self.module.packagepath) \
             if self.module.packagepath is not None else None
 
+        #FIXME: Refactor "_added_datas", "_added_binaries", and
+        #"_deleted_imports" into sets. Since order of importation is
+        #significant, "_added_imports" must remain a list.
+
         # Private attributes.
         self._added_binaries = []
         self._added_datas = []
@@ -431,7 +493,7 @@ class PostGraphAPI(object):
         if isinstance(list_of_tuples, TOC):
             self._added_binaries.extend(i[:2] for i in list_of_tuples)
         else:
-            self._added_binaries.extend(list_of_tuples)
+            self._added_binaries.extend(format_binaries_and_datas(list_of_tuples))
 
     def add_datas(self, list_of_tuples):
         """
@@ -445,4 +507,4 @@ class PostGraphAPI(object):
         if isinstance(list_of_tuples, TOC):
             self._added_datas.extend(i[:2] for i in list_of_tuples)
         else:
-            self._added_datas.extend(list_of_tuples)
+            self._added_datas.extend(format_binaries_and_datas(list_of_tuples))

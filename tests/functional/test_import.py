@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 #-----------------------------------------------------------------------------
-# Copyright (c) 2005-2016, PyInstaller Development Team.
+# Copyright (c) 2005-2019, PyInstaller Development Team.
 #
 # Distributed under the terms of the GNU General Public License with exception
 # for distributing bootloader.
@@ -9,19 +9,29 @@
 #-----------------------------------------------------------------------------
 
 import os
-import pytest
-import sys
 import glob
-import ctypes, ctypes.util
+import ctypes
+import ctypes.util
 
-from PyInstaller.compat import is_win
-from PyInstaller.utils.tests import skipif, importorskip, xfail_py2, \
-  skipif_notwin, xfail, is_py2
+import pytest
 
+from PyInstaller.compat import is_darwin, is_py2, is_py3, is_py35, is_win
+from PyInstaller.utils.tests import skipif, importorskip, \
+    skipif_notwin, skipif_no_compiler, xfail, has_compiler
 
 # :todo: find a way to get this from `conftest` or such
 # Directory with testing modules used in some tests.
 _MODULES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'modules')
+
+def test_nameclash(pyi_builder):
+    # test-case for issue #964: Nameclashes in module information gathering
+    # All pyinstaller specific module attributes should be prefixed,
+    # to avoid nameclashes.
+    pyi_builder.test_source(
+        """
+        import pyi_testmod_nameclash.nameclash
+        """)
+
 
 def test_relative_import(pyi_builder):
     pyi_builder.test_source(
@@ -57,6 +67,74 @@ def test_relative_import3(pyi_builder):
         """
     )
 
+@xfail(reason='modulegraph bug')
+def test_import_missing_submodule(pyi_builder):
+    # If a submodule is missing, the parent submodule must be imported.
+    pyi_builder.test_source(
+        """
+        try:
+            import pyi_testmod_missing_submod.aaa.bbb
+        except ImportError as e:
+            assert e.message.endswith(' bbb')
+        else:
+            raise RuntimeError('Buggy test-case: module'
+                       'pyi_testmod_missing_submod.aaa.bbb must not exist')
+        # parent module exists and must be included
+        __import__('pyi_testmod_missing_submod.aaa')
+        """)
+
+def test_import_submodule_global_shadowed(pyi_builder):
+    """
+    Functional test validating issue #1919.
+
+    `ModuleGraph` previously ignored `from`-style imports of submodules from
+    packages whose `__init__` submodules declared global variables of the same
+    name as those submodules. This test exercises this sporadic edge case by
+    unsuccessfully importing a submodule "shadowed" by a global variable of the
+    same name defined by their package's `__init__` submodule.
+    """
+
+    pyi_builder.test_source(
+        """
+        # Assert that this submodule is shadowed by a string global variable.
+        from pyi_testmod_submodule_global_shadowed import submodule
+        assert type(submodule) == str
+
+        # Assert that this submodule is still frozen into this test application.
+        # To do so:
+        #
+        # 1. Delete this global variable from its parent package.
+        # 2. Assert that this submodule is unshadowed by this global variable.
+        import pyi_testmod_submodule_global_shadowed, sys
+        del  pyi_testmod_submodule_global_shadowed.submodule
+        from pyi_testmod_submodule_global_shadowed import submodule
+        assert type(submodule) == type(sys)
+        """)
+
+
+def test_import_submodule_global_unshadowed(pyi_builder):
+    '''
+    Functional test validating issue #1919.
+
+    `ModuleGraph` previously ignored `from`-style imports of submodules from
+    packages whose `__init__` submodules declared global variables of the same
+    name as those submodules. This test exercises this sporadic edge case by
+    successfully importing a submodule:
+
+    * Initially "shadowed" by a global variable of the same name defined by
+      their package's `__init__` submodule.
+    * Subsequently "unshadowed" when this global variable is then undefined by
+      their package's `__init__` submodule.
+    '''
+
+    pyi_builder.test_source(
+        """
+        # Assert that this submodule is unshadowed by this global variable.
+        import sys
+        from pyi_testmod_submodule_global_unshadowed import submodule
+        assert type(submodule) == type(sys)
+        """)
+
 
 def test_module_with_coding_utf8(pyi_builder):
     # Module ``utf8_encoded_module`` simply has an ``coding`` header
@@ -84,8 +162,21 @@ def test_error_during_import(pyi_builder):
             raise RuntimeError("failure!")
         """)
 
+def test_import_non_existing_raises_import_error(pyi_builder):
+    pyi_builder.test_source(
+        """
+        try:
+            import zzzzzz.zzzzzzzz.zzzzzzz.non.existing.module.error_during_import2
+        except ImportError:
+            print("OK")
+        else:
+            raise RuntimeError("ImportError not raised")
+        """)
+
 # :todo: Use some package which is already installed for some other
 # reason instead of `simplejson` which is only used here.
+@skipif(is_py3, reason="Python 3 doesn't use the CExtensionImporter, so it "
+        "doesn't need testing.")
 @importorskip('simplejson')
 def test_c_extension(pyi_builder):
     pyi_builder.test_script('pyi_c_extension.py')
@@ -107,14 +198,28 @@ def test_import_respects_path(pyi_builder, script_dir):
       ['--additional-hooks-dir='+script_dir.join('pyi_hooks').strpath])
 
 
-def test_import_pyqt5_uic_port(pyi_builder):
-    extra_path = os.path.join(_MODULES_DIR, 'pyi_import_pyqt.uic.port')
-    pyi_builder.test_script('pyi_import_pyqt5.uic.port.py',
-                            pyi_args=['--path', extra_path], )
+# Verify correct handling of sys.meta_path redirects like pkg_resources 28.6.1
+# does: '_vendor.xxx' gets imported as 'extern.xxx' and using '__import__()'.
+# Note: This also requires a hook, since 'pyi_testmod_metapath1._vendor' is
+# not imported directly and won't be found by modulegraph.
+def test_import_metapath1(pyi_builder, script_dir):
+    pyi_builder.test_source('import pyi_testmod_metapath1',
+      ['--additional-hooks-dir='+script_dir.join('pyi_hooks').strpath])
+
+
+@importorskip('PyQt5')
+def test_import_pyqt5_uic_port(script_dir, pyi_builder):
+    extra_path = os.path.join(_MODULES_DIR, 'pyi_import_pyqt_uic_port')
+    pyi_builder.test_script('pyi_import_pyqt5_uic_port.py',
+        # Add the path to a fake PyQt5 package, used for this test.
+        pyi_args=['--path', extra_path])
 
 
 #--- ctypes ----
 
+@skipif_no_compiler
+@skipif(is_py35 and is_win,
+        reason="MSVCR not directly loadable on py3.5, see https://bugs.python.org/issue23606")
 def test_ctypes_CDLL_c(pyi_builder):
     # Make sure we are able to load the MSVCRXX.DLL resp. libc.so we are
     # currently bound. This is some of a no-brainer since the resp. dll/so
@@ -123,6 +228,18 @@ def test_ctypes_CDLL_c(pyi_builder):
         """
         import ctypes, ctypes.util
         lib = ctypes.CDLL(ctypes.util.find_library('c'))
+        assert lib is not None
+        """)
+
+@skipif_no_compiler
+@skipif(is_win, reason="CDLL(None) seams to be not valid on Windows")
+def test_ctypes_CDLL_None(pyi_builder):
+    # Make sure we are able to load CDLL(None)
+    # -> pip does this for some reason
+    pyi_builder.test_source(
+        """
+        import ctypes, ctypes.util
+        lib = ctypes.CDLL(None)
         assert lib is not None
         """)
 
@@ -147,6 +264,7 @@ def __monkeypatch_resolveCtypesImports(monkeypatch, compiled_dylib):
                         mocked_resolveCtypesImports)
 
 
+#FIXME: For reusability, move this to "PyInstaller.utils.tests".
 def skip_if_lib_missing(libname, text=None):
     """
     pytest decorator to evaluate the required shared lib.
@@ -211,9 +329,13 @@ for prefix in ('', 'ctypes.'):
     for funcname in  ('CDLL', 'PyDLL', 'WinDLL', 'OleDLL', 'cdll.LoadLibrary'):
         ids.append(prefix+funcname)
         params = (prefix+funcname, ids[-1])
-        if funcname in ("WinDLL", "OleDLL"):
+        # Marking doesn't seem to chain here, so select just one skippping mark
+        # instead of both.
+        if not has_compiler:
+            params = pytest.param(*params, marks=skipif_no_compiler(params))
+        elif funcname in ("WinDLL", "OleDLL"):
             # WinDLL, OleDLL only work on windows.
-            params = skipif_notwin(params)
+            params = pytest.param(*params, marks=skipif_notwin(params))
         parameters.append(params)
 
 @pytest.mark.parametrize("funcname,test_id", parameters, ids=ids)
@@ -430,7 +552,7 @@ def test_nspkg3_bbb_zzz(pyi_builder):
         pyi_args=['--paths', os.pathsep.join(pathex)],
     )
 
-@skipif(is_py2, reason="requires Python 3.3")
+@skipif(is_py2, reason="requires Python 3")
 def test_nspkg_pep420(pyi_builder):
     # Test inclusion of PEP 420 namespace packages.
     pathex = glob.glob(os.path.join(_MODULES_DIR, 'nspkg-pep420', 'path*'))
@@ -456,24 +578,8 @@ def test_pkg_without_hook_for_pkg(pyi_builder, script_dir):
         ['--additional-hooks-dir=%s' % script_dir.join('pyi_hooks')])
 
 
-
+@xfail(is_darwin, reason='Issue #1895.')
 def test_app_with_plugin(pyi_builder, data_dir, monkeypatch):
-
-    from PyInstaller.building.build_main import Analysis
-    class MyAnalysis(Analysis):
-        def __init__(self, *args, **kwargs):
-            kwargs['datas'] = datas
-            # Setting back is required to make `super()` within
-            # Analysis access the correct class. Do not use
-            # `monkeypatch.undo()` as this will undo *all*
-            # monkeypathes.
-            monkeypatch.setattr('PyInstaller.building.build_main.Analysis',
-                                Analysis)
-            super(MyAnalysis, self).__init__(*args, **kwargs)
-
-    monkeypatch.setattr('PyInstaller.building.build_main.Analysis', MyAnalysis)
-
-    # :fixme: When PyInstaller supports setting datas via the
-    # command-line, us this here instead of monkeypatching Analysis.
-    datas = [('data/*/static_plugin.py', '.')]
-    pyi_builder.test_script('pyi_app_with_plugin.py')
+    datas = os.pathsep.join(('data/*/static_plugin.py', os.curdir))
+    pyi_builder.test_script('pyi_app_with_plugin.py',
+                            pyi_args=['--add-data', datas])
